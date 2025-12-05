@@ -6,6 +6,7 @@
 
 > **Un server proxy universale per streaming HLS, M3U8 e IPTV** 🎬  
 > Supporto nativo per Vavoo, DaddyLive HD e tutti i servizi di streaming  
+> Compatibile per addons Stremio utilizzandolo come MediaFlow Proxy
 > Interfaccia web integrata e configurazione zero
 
 ---
@@ -84,6 +85,8 @@ gunicorn --bind 0.0.0.0:7860 --workers 4 --worker-class aiohttp.worker.GunicornW
 3. Deploy automatico
 4. **Pronto!**
 
+**Alternativa:** Come alternativa, puoi copiare il contenuto del file `Dockerfile-hf` e metterlo su HuggingFace, impostando `api_password` come secret.
+
 ### 🌐 Railway / Heroku
 
 ```bash
@@ -93,6 +96,13 @@ railway login && railway init && railway up
 # Heroku
 heroku create EasyProxy && git push heroku main
 ```
+
+### 🚀 Koyeb
+1. Crea una nuova **Web Service** su Koyeb.
+2. Seleziona **GitHub** come fonte e inserisci l'URL del repository: `https://github.com/nzo66/EasyProxy`
+3. Vai nelle **Settings** -> **Environment variables**.
+4. Aggiungi la variabile `PORT` con valore `8000` (richiesto da Koyeb).
+5. Deploy!
 
 ### 🎯 Configurazione Cloud Ottimale
 
@@ -175,6 +185,9 @@ DLHD_PROXY=socks5://proxy1.com:1080,socks5://proxy2.com:1080
 
 # Proxy specifico per Vavoo
 VAVOO_PROXY=socks5://vavoo-proxy.net:9050
+
+# Password per proteggere le API
+API_PASSWORD=mysecretpassword
 ```
 
 Le variabili supportate sono:
@@ -182,6 +195,7 @@ Le variabili supportate sono:
 - `VAVOO_PROXY`: Proxy specifico per le richieste a Vavoo.
 - `DLHD_PROXY`: Proxy specifico per le richieste a DaddyLiveHD.
 - `PORT`: Porta su cui il server ascolta (default: 7860).
+- `API_PASSWORD`: Password per proteggere l'accesso alle API.
 
 **Esempio per cambiare la porta:**
 
@@ -241,21 +255,7 @@ Devi aggiungere `?url=` (o `?d=`) seguito dal link del video che vuoi processare
 - `api_password`: (Opzionale) Password API se configurata.
 
 **Servizi Supportati:**
-Vavoo, DaddyLiveHD, Mixdrop, Orion, Sportsonline, Streamtape, VixSrc, Voe.
-
-**Esempio di Risposta (JSON):**
-```json
-{
-  "destination_url": "https://stream.example.com/video.m3u8",
-  "request_headers": {
-    "User-Agent": "Mozilla/5.0...",
-    "Referer": "https://example.com/"
-  },
-  "endpoint_type": "hls_proxy",
-  "proxy_url": "http://server:7860/proxy/manifest.m3u8?d=...",
-  "query_params": {}
-}
-```
+Vavoo, DaddyLiveHD, Mixdrop, Orion, Sportsonline, Streamtape, VixSrc, Voe e molto altro!
 
 ### 📺 Proxy Endpoints
 

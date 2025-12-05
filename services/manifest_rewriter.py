@@ -6,6 +6,12 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Conditional import for DLHD detection
+try:
+    from extractors.dlhd import DLHDExtractor
+except ImportError:
+    DLHDExtractor = None
+
 class ManifestRewriter:
     @staticmethod
     def rewrite_mpd_manifest(manifest_content: str, base_url: str, proxy_base: str, stream_headers: dict, clearkey_param: str = None, api_password: str = None) -> str:
@@ -137,22 +143,35 @@ class ManifestRewriter:
         """✅ AGGIORNATA: Riscrive gli URL nei manifest HLS per passare attraverso il proxy (incluse chiavi AES)"""
         lines = manifest_content.split('\n')
         rewritten_lines = []
-        
-        # ✅ NUOVO: Logica speciale per VixSrc
-        # Determina se l'URL base è di VixSrc per applicare la logica personalizzata.
+
+        # ✅ NUOVO: Logica speciale per VixSrc e DLHD
+        # Determina se l'URL base è di VixSrc o DLHD per applicare la logica personalizzata.
         is_vixsrc_stream = False
+        is_dlhd_stream = False
+        logger.info(f"Manifest rewriter called with base_url: {base_url}, original_channel_url: {original_channel_url}")
         try:
             # Usiamo l'URL originale della richiesta per determinare l'estrattore
             # Questo è più affidabile di `base_url` che potrebbe essere già un URL di playlist.
             if get_extractor_func:
-                original_request_url = stream_headers.get('referer', base_url)
+                original_request_url = stream_headers.get('referer') or stream_headers.get('Referer') or base_url
+                logger.info(f"Using original_request_url for extractor detection: {original_request_url}")
                 extractor = await get_extractor_func(original_request_url, {})
+                logger.info(f"Extractor obtained: {type(extractor).__name__}")
                 if hasattr(extractor, 'is_vixsrc') and extractor.is_vixsrc:
                     is_vixsrc_stream = True
                     logger.info("Rilevato stream VixSrc. Applicherò la logica di filtraggio qualità e non-proxy.")
-        except Exception:
+                elif DLHDExtractor and isinstance(extractor, DLHDExtractor):
+                    is_dlhd_stream = True
+                    logger.info(f"✅ Rilevato stream DLHD (type: {type(extractor).__name__}). Proxierò solo la chiave AES, non i segmenti.")
+                else:
+                    logger.info(f"Extractor type: {type(extractor).__name__}, DLHDExtractor available: {DLHDExtractor is not None}")
+            else:
+                logger.info("No get_extractor_func provided")
+        except Exception as e:
             # Se l'estrattore non viene trovato, procedi normalmente.
+            logger.error(f"Error in extractor detection: {e}")
             pass
+        logger.info(f"Stream detection result: is_dlhd_stream={is_dlhd_stream}, is_vixsrc_stream={is_vixsrc_stream}")
 
         if is_vixsrc_stream:
             streams = []
@@ -192,6 +211,10 @@ class ManifestRewriter:
         
         if api_password:
             header_params += f"&api_password={api_password}"
+
+        # Estrai query params dal base_url per ereditarli se necessario (es. token)
+        base_parsed = urllib.parse.urlparse(base_url)
+        base_query = base_parsed.query
 
         for line in lines:
             line = line.strip()
@@ -247,12 +270,40 @@ class ManifestRewriter:
                     encoded_media_url = urllib.parse.quote(absolute_media_url, safe='')
                     
                     # I sottotitoli sono manifest, quindi usano l'endpoint del proxy principale
-                    proxy_media_url = f"{proxy_base}/proxy/hls/manifest.m3u8?d={encoded_media_url}{header_params}"
+                    # Per DLHD, anche i sottotitoli non vengono proxati se sono considerati media
+                    if is_dlhd_stream:
+                        new_line = line[:uri_start] + absolute_media_url + line[uri_end:]
+                        rewritten_lines.append(new_line)
+                        logger.info(f"🔄 DLHD: Media diretto: {absolute_media_url}")
+                    else:
+                        proxy_media_url = f"{proxy_base}/proxy/hls/manifest.m3u8?d={encoded_media_url}{header_params}"
+                        new_line = line[:uri_start] + proxy_media_url + line[uri_end:]
+                        rewritten_lines.append(new_line)
+                        logger.info(f"🔄 Redirected Media URL: {absolute_media_url} -> {proxy_media_url}")
+                else:
+                    rewritten_lines.append(line)
+
+            # ✅ NUOVO: Gestione per EXT-X-MAP (fMP4 initialization segment)
+            elif line.startswith('#EXT-X-MAP:') and 'URI=' in line:
+                uri_start = line.find('URI="') + 5
+                uri_end = line.find('"', uri_start)
+                
+                if uri_start > 4 and uri_end > uri_start:
+                    original_map_url = line[uri_start:uri_end]
+                    absolute_map_url = urljoin(base_url, original_map_url)
                     
-                    # Sostituisci l'URI nel tag
-                    new_line = line[:uri_start] + proxy_media_url + line[uri_end:]
-                    rewritten_lines.append(new_line)
-                    logger.info(f"🔄 Redirected Media URL: {absolute_media_url} -> {proxy_media_url}")
+                    if is_dlhd_stream:
+                         new_line = line[:uri_start] + absolute_map_url + line[uri_end:]
+                         rewritten_lines.append(new_line)
+                         logger.info(f"🔄 DLHD: MAP diretto: {absolute_map_url}")
+                    else:
+                        encoded_map_url = urllib.parse.quote(absolute_map_url, safe='')
+                        # Usa l'endpoint segment.mp4 che è gestito da handle_proxy_request
+                        proxy_map_url = f"{proxy_base}/proxy/hls/segment.mp4?d={encoded_map_url}{header_params}"
+                        
+                        new_line = line[:uri_start] + proxy_map_url + line[uri_end:]
+                        rewritten_lines.append(new_line)
+                        logger.info(f"🔄 Redirected MAP URL: {absolute_map_url} -> {proxy_map_url}")
                 else:
                     rewritten_lines.append(line)
 
@@ -261,14 +312,33 @@ class ManifestRewriter:
                 # ✅ CORREZIONE: Riscrive qualsiasi URL relativo o assoluto che non sia un tag.
                 # Distingue tra manifest (.m3u8, .css) e segmenti (.ts, .html, etc.).
                 absolute_url = urljoin(base_url, line) if not line.startswith('http') else line
-                encoded_url = urllib.parse.quote(absolute_url, safe='')
-                
-                # I sub-manifest o URL che potrebbero contenere altri manifest vengono inviati all'endpoint proxy.
-                # ✅ RIPRISTINO LOGICA ORIGINALE (SEMPLIFICATA)
-                # Usiamo l'endpoint standard di EasyProxy per tutto, garantendo la massima compatibilità
-                # con la logica che "già funzionava".
-                proxy_url = f"{proxy_base}/proxy/manifest.m3u8?url={encoded_url}{header_params}"
-                rewritten_lines.append(proxy_url)
+
+                # ✅ NUOVO: Eredita i query params (es. token) dal base_url se non presenti nel segmento
+                if base_query and '?' not in absolute_url:
+                    absolute_url += f"?{base_query}"
+
+                if is_dlhd_stream:
+                    # Per DLHD, non proxare i segmenti, usa l'URL assoluto diretto
+                    rewritten_lines.append(absolute_url)
+                    logger.info(f"🔄 DLHD: Segmento diretto: {absolute_url}")
+                else:
+                    # Per altri stream, proxare normalmente
+                    encoded_url = urllib.parse.quote(absolute_url, safe='')
+
+                    # I sub-manifest o URL che potrebbero contenere altri manifest vengono inviati all'endpoint proxy.
+                    # ✅ RIPRISTINO LOGICA ORIGINALE (SEMPLIFICATA)
+                    # Usiamo l'endpoint standard di EasyProxy per tutto, garantendo la massima compatibilità
+                    # con la logica che "già funzionava".
+                    
+                    # Se è un manifest (.m3u8), usa l'endpoint manifest.
+                    # Altrimenti, assumiamo sia un segmento (fMP4, TS, etc.) e usiamo l'endpoint segment.
+                    if '.m3u8' in absolute_url:
+                         proxy_url = f"{proxy_base}/proxy/manifest.m3u8?url={encoded_url}{header_params}"
+                    else:
+                         # Segmento (o altro file binario)
+                         proxy_url = f"{proxy_base}/proxy/hls/segment.mp4?d={encoded_url}{header_params}"
+                    
+                    rewritten_lines.append(proxy_url)
 
             else:
                 # Aggiunge tutti gli altri tag (es. #EXTINF, #EXT-X-ENDLIST)

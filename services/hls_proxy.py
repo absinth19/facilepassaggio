@@ -22,11 +22,17 @@ from services.manifest_rewriter import ManifestRewriter
 
 # --- Moduli Esterni ---
 VavooExtractor, DLHDExtractor, VixSrcExtractor, PlaylistBuilder, SportsonlineExtractor = None, None, None, None, None
-MixdropExtractor, VoeExtractor, StreamtapeExtractor, OrionExtractor = None, None, None, None
+MixdropExtractor, VoeExtractor, StreamtapeExtractor, OrionExtractor, FreeshotExtractor = None, None, None, None, None
 
 logger = logging.getLogger(__name__)
 
 # Importazione condizionale degli estrattori
+try:
+    from extractors.freeshot import FreeshotExtractor
+    logger.info("✅ Modulo FreeshotExtractor caricato.")
+except ImportError:
+    logger.warning("⚠️ Modulo FreeshotExtractor non trovato.")
+
 try:
     from extractors.vavoo import VavooExtractor
     logger.info("✅ Modulo VavooExtractor caricato.")
@@ -122,7 +128,7 @@ class HLSProxy:
                         self.extractors[key] = VavooExtractor(request_headers, proxies=proxies)
                     return self.extractors[key]
                 
-                elif host in ["dlhd", "daddylive"]:
+                elif host in ["dlhd", "daddylive", "daddyhd"]:
                     key = "dlhd"
                     proxies = DLHD_PROXIES or GLOBAL_PROXIES
                     if key not in self.extractors:
@@ -159,6 +165,11 @@ class HLSProxy:
                     if key not in self.extractors:
                         self.extractors[key] = OrionExtractor(request_headers, proxies=GLOBAL_PROXIES)
                     return self.extractors[key]
+                
+                elif host == "freeshot":
+                    if key not in self.extractors:
+                        self.extractors[key] = FreeshotExtractor(request_headers, proxies=GLOBAL_PROXIES)
+                    return self.extractors[key]
 
             # 2. Auto-detection basata sull'URL 
             if "vavoo.to" in url:
@@ -167,7 +178,7 @@ class HLSProxy:
                 if key not in self.extractors:
                     self.extractors[key] = VavooExtractor(request_headers, proxies=proxies)
                 return self.extractors[key]
-            elif any(domain in url for domain in ["daddylive", "dlhd"]) or re.search(r'stream-\d+\.php', url):
+            elif any(domain in url for domain in ["daddylive", "dlhd", "daddyhd"]) or re.search(r'watch\.php\?id=\d+', url):
                 key = "dlhd"
                 proxies = DLHD_PROXIES or GLOBAL_PROXIES
                 if key not in self.extractors:
@@ -193,6 +204,11 @@ class HLSProxy:
                 key = "voe"
                 if key not in self.extractors:
                     self.extractors[key] = VoeExtractor(request_headers, proxies=GLOBAL_PROXIES)
+                return self.extractors[key]
+            elif "popcdn.day" in url:
+                key = "freeshot"
+                if key not in self.extractors:
+                    self.extractors[key] = FreeshotExtractor(request_headers, proxies=GLOBAL_PROXIES)
                 return self.extractors[key]
             elif "streamtape.com" in url or "streamtape.to" in url or "streamtape.net" in url:
                 key = "streamtape"
@@ -220,6 +236,7 @@ class HLSProxy:
             logger.warning(f"⛔ Accesso negato: Password API non valida o mancante. IP: {request.remote}")
             return web.Response(status=401, text="Unauthorized: Invalid API Password")
 
+        
         extractor = None
         try:
             target_url = request.query.get('url') or request.query.get('d')
@@ -233,14 +250,12 @@ class HLSProxy:
                 target_url = urllib.parse.unquote(target_url)
             except:
                 pass
-                
-            # Log removed for cleaner output
-            
-            # DEBUG LOGGING
+            # DEBUG LOGGING    
             print(f"🔍 [DEBUG] Processing URL: {target_url}")
             print(f"   Headers: {dict(request.headers)}")
             
             extractor = await self.get_extractor(target_url, dict(request.headers))
+            
             print(f"   Extractor: {type(extractor).__name__}")
             
             try:
@@ -248,6 +263,7 @@ class HLSProxy:
                 result = await extractor.extract(target_url, force_refresh=force_refresh)
                 stream_url = result["destination_url"]
                 stream_headers = result.get("request_headers", {})
+
                 print(f"   Resolved Stream URL: {stream_url}")
                 print(f"   Stream Headers: {stream_headers}")
                 
@@ -763,6 +779,7 @@ class HLSProxy:
             async with ClientSession(timeout=timeout) as session:
                 async with session.get(stream_url, headers=headers, **connector_kwargs, ssl=False) as resp:
                     content_type = resp.headers.get('content-type', '')
+                    
                     print(f"   Upstream Response: {resp.status} [{content_type}]")
                     
                     # Gestione special per manifest HLS
@@ -1247,3 +1264,4 @@ class HLSProxy:
                     await extractor.close()
         except Exception as e:
             logger.error(f"Errore durante cleanup: {e}")
+
