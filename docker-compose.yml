@@ -1,7 +1,7 @@
 services:  
   EasyProxy:
-    build: https://github.com/nzo66/EasyProxy.git#main
-    container_name: EasyProxy
+    build: https://github.com/absinth19/facilepassaggio.git#main
+    container_name: facilepassaggio
     restart: unless-stopped
     ports:
       - '${PORT:-7860}:${PORT:-7860}' #modifica la variabile "PORT" per cambiare la porta
