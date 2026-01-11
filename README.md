@@ -30,7 +30,7 @@
 |------------------------|------------------------|-------------------|
 | HLS, M3U8, MPD, DLHD streams, VIXSRC | Vavoo, DLHD, Sportsonline, VixSrc | Connessioni async e keep-alive |
 | **🔓 DRM Decryption** | **🎬 MPD to HLS** | **🔑 ClearKey Support** |
-| CENC decryption con PyCryptodome | Conversione automatica DASH → HLS | Server-side ClearKey per VLC |
+| ClearKey via FFmpeg transcoding | Conversione automatica DASH → HLS | Server-side ClearKey per VLC |
 
 | 🌐 **Multi-formato** | 🔄 **Retry Logic** | 🚀 **Scalabilità** |
 |--------------------|-------------------|------------------|
@@ -100,9 +100,11 @@ heroku create EasyProxy && git push heroku main
 ### 🚀 Koyeb
 1. Crea una nuova **Web Service** su Koyeb.
 2. Seleziona **GitHub** come fonte e inserisci l'URL del repository: `https://github.com/nzo66/EasyProxy`
-3. Vai nelle **Settings** -> **Environment variables**.
-4. Aggiungi la variabile `PORT` con valore `8000` (richiesto da Koyeb).
-5. Deploy!
+3. Seleziona Dockerfile
+4. Seleziona CPU Eco - Free
+5. Vai in **Environment variables**.
+6. Aggiungi la variabile `PORT` con valore `8000` (richiesto da Koyeb).
+7. Deploy!
 
 ### 🎯 Configurazione Cloud Ottimale
 
@@ -121,8 +123,15 @@ Ottimizzato per:
 ### 📋 Requisiti
 
 - **Python 3.8+**
+- **FFmpeg** (necessario per transcoding MPD streams)
 - **aiohttp**
 - **gunicorn**
+
+> ⚠️ **Nota:** Se non usi Docker, devi installare FFmpeg manualmente:
+> - **Windows**: Scarica da [ffmpeg.org](https://ffmpeg.org/download.html) e aggiungi al PATH
+> - **Linux/Debian**: `sudo apt install ffmpeg`
+> - **macOS**: `brew install ffmpeg`
+> - **Termux**: `pkg install ffmpeg`
 
 ### 🔧 Installazione Completa
 
@@ -136,15 +145,20 @@ pip install -r requirements.txt
 
 # Avvio 
 gunicorn --bind 0.0.0.0:7860 --workers 4 --worker-class aiohttp.worker.GunicornWebWorker app:app
+
+# Avvio su Windows
+python app.py
 ```
 
 ### 🐧 Termux (Android)
 
 ```bash
 pkg update && pkg upgrade
-pkg install python git -y
+pkg install python git ffmpeg -y
 git clone https://github.com/nzo66/EasyProxy.git
 cd EasyProxy
+pkg install clang libxml2 libxslt python
+pip install --upgrade pip setuptools wheel
 pip install -r requirements.txt
 gunicorn --bind 0.0.0.0:7860 --workers 4 --worker-class aiohttp.worker.GunicornWebWorker app:app
 ```
@@ -180,22 +194,31 @@ Il modo più semplice per configurare i proxy è tramite un file `.env`.
 # Proxy globale per tutto il traffico
 GLOBAL_PROXY=http://user:pass@myproxy.com:8080
 
-# Proxy multipli per DLHD (uno verrà scelto a caso)
-DLHD_PROXY=socks5://proxy1.com:1080,socks5://proxy2.com:1080
+# --- Regole di Trasporto (TRANSPORT_ROUTES) ---
+# Sistema avanzato per routing proxy basato su URL patterns.
+# Formato: {URL=pattern, PROXY=proxy_url, DISABLE_SSL=true}, {URL=pattern2, PROXY=proxy_url2, DISABLE_SSL=true}
+# - URL: pattern da cercare nell'URL (es. vavoo.to, dlhd.dad, giokko.ru)
+# - PROXY: proxy da usare (lascia vuoto per connessione diretta)
+# - DISABLE_SSL: per disattivare la verifica ssl
 
-# Proxy specifico per Vavoo
-VAVOO_PROXY=socks5://vavoo-proxy.net:9050
+TRANSPORT_ROUTES={URL=vavoo.to, PROXY=socks5://proxy1:1080, DISABLE_SSL=true}, {URL=dlhd.dad, PROXY=http://proxy2:8080, DISABLE_SSL=true}
 
 # Password per proteggere le API
 API_PASSWORD=mysecretpassword
+
+# --- Modalità Elaborazione MPD ---
+# Scegli come gestire gli stream MPD/DASH:
+# - ffmpeg: Transcoding via FFmpeg (richiede FFmpeg installato, alta CPU ma sync A/V migliore)
+# - legacy: Usa mpd_converter + drm_decrypter (più leggero ma possibili problemi di compatibilità)
+MPD_MODE=legacy
 ```
 
 Le variabili supportate sono:
 - `GLOBAL_PROXY`: Proxy di fallback per tutte le richieste.
-- `VAVOO_PROXY`: Proxy specifico per le richieste a Vavoo.
-- `DLHD_PROXY`: Proxy specifico per le richieste a DaddyLiveHD.
+- `TRANSPORT_ROUTES`: Sistema avanzato per routing proxy basato su URL patterns.
 - `PORT`: Porta su cui il server ascolta (default: 7860).
 - `API_PASSWORD`: Password per proteggere l'accesso alle API.
+- `MPD_MODE`: Modalità elaborazione MPD (`ffmpeg` o `legacy`). Default: `legacy`.
 
 **Esempio per cambiare la porta:**
 

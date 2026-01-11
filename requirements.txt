@@ -1,9 +1,10 @@
 aiohttp
-aiohttp-proxy
+aiohttp-socks
 gunicorn
 python-dotenv
 zstandard
-pycryptodome
 beautifulsoup4
 lxml
 python-socks
+pycryptodome
+pydash2hls

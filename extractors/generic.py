@@ -4,7 +4,7 @@ import ssl
 import urllib.parse
 from urllib.parse import urlparse
 from aiohttp import ClientSession, ClientTimeout, TCPConnector
-from aiohttp_proxy import ProxyConnector
+from aiohttp_socks import ProxyConnector
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +38,7 @@ class GenericHLSExtractor:
                 ssl_context.verify_mode = ssl.CERT_NONE
                 
                 connector = TCPConnector(
-                    limit=20, limit_per_host=10, 
+                    limit=0, limit_per_host=0, 
                     keepalive_timeout=60, enable_cleanup_closed=True, 
                     force_close=False, use_dns_cache=True,
                     ssl=ssl_context
@@ -60,7 +60,14 @@ class GenericHLSExtractor:
         parsed_url = urlparse(url)
         origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
         headers = self.base_headers.copy()
-        headers.update({"referer": origin, "origin": origin})
+        
+        # ✅ FIX: Non sovrascrivere Referer/Origin se già presenti in request_headers (es. passati via h_ params)
+        # GenericHLSExtractor viene usato come fallback per i segmenti, ma se abbiamo già headers specifici
+        # (come quelli di DLHD), dobbiamo preservarli e non resettarli al dominio del segmento.
+        if not any(k.lower() == 'referer' for k in self.request_headers):
+            headers["referer"] = origin
+        if not any(k.lower() == 'origin' for k in self.request_headers):
+            headers["origin"] = origin
 
         # ✅ FIX: Ripristinata logica conservativa. Non inoltrare tutti gli header del client
         # per evitare conflitti (es. Host, Cookie, Accept-Encoding) con il server di destinazione.
@@ -69,7 +76,16 @@ class GenericHLSExtractor:
         # Only allow specific headers that are safe or necessary for authentication.
         for h, v in self.request_headers.items():
             h_lower = h.lower()
-            if h_lower in ["authorization", "x-api-key", "x-auth-token", "referer", "user-agent", "cookie"]:
+            # ✅ FIX DLHD: Ora accetta User-Agent passato via h_ params (contiene Chrome UA completo)
+            # Salta solo se è lo User-Agent del player (es. "Player (Linux; Android 13)")
+            # ma accetta se è un Chrome UA (contiene "Chrome" o "AppleWebKit")
+            if h_lower == "user-agent":
+                # Se è un vero browser UA (ha Chrome/Safari), usalo sovrascrivendo il default
+                if "chrome" in v.lower() or "applewebkit" in v.lower():
+                    headers["user-agent"] = v
+                continue
+                
+            if h_lower in ["authorization", "x-api-key", "x-auth-token", "cookie", "referer", "origin", "x-channel-key"]:
                 headers[h] = v
             # Explicitly block forwarding of IP-related headers
             if h_lower in ["x-forwarded-for", "x-real-ip", "forwarded", "via"]:
