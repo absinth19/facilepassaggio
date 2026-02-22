@@ -34,6 +34,8 @@ class DLHDExtractor:
         r'stream-(\d+)\.php',
         r'[?&]id=(\d+)',
         r'daddyhd\.php\?id=(\d+)',
+        r'stream=([^&]+)',  # Support for string IDs (e.g. ZonaDAZN)
+        r'/player/([^/]+)$', # Support for /player/ZonaDAZN
     ]
 
     def __init__(self, request_headers: dict, proxies: list = None):
@@ -57,11 +59,15 @@ class DLHDExtractor:
 
         # ✅ Configurazione server dinamica dal worker (usando TEMPLATE completi)
         # Tutti i valori provengono dal worker, i fallback sono solo per il primo avvio
-        self.auth_url = cache_data.get('auth_url', 'https://security.kiko2.ru/auth2.php')
-        self.stream_cdn_template = cache_data.get('stream_cdn_template', 'https://top1.kiko2.ru/top1/cdn/{CHANNEL}/mono.css')
-        self.stream_other_template = cache_data.get('stream_other_template', 'https://{SERVER_KEY}new.kiko2.ru/{SERVER_KEY}/{CHANNEL}/mono.css')
-        self.server_lookup_url = cache_data.get('server_lookup_url', 'https://chevy.kiko2.ru/server_lookup')
-        self.base_domain = cache_data.get('base_domain', 'kiko2.ru')
+        self.auth_url = cache_data.get('auth_url')
+        self.stream_cdn_template = cache_data.get('stream_cdn_template')
+        self.stream_other_template = cache_data.get('stream_other_template')
+        self.server_lookup_url = cache_data.get('server_lookup_url')
+        self.base_domain = cache_data.get('base_domain')
+        self.lovecdn_url = cache_data.get('lovecdn_url') # ✅ Cache lovecdn url
+        
+        # Track failed LoveCDN attempts to implement retry logic
+        self._lovecdn_failure_time: Dict[str, float] = {} 
         
         logger.info(f"Hosts loaded at startup: {self.iframe_hosts}")
         logger.info(f"Auth URL: {self.auth_url}")
@@ -69,38 +75,32 @@ class DLHDExtractor:
         logger.info(f"Stream Other Template: {self.stream_other_template}")
         logger.info(f"Server Lookup URL: {self.server_lookup_url}")
         logger.info(f"Base Domain: {self.base_domain}")
+        if self.lovecdn_url:
+            logger.info(f"LoveCDN URL: {self.lovecdn_url}")
 
     def _load_cache(self) -> Dict[str, Any]:
-        """Carica la cache da un file codificato in Base64 all'avvio. Ritorna struttura completa."""
+        """Carica la cache da un file (supporta JSON puro o Base64 legacy)."""
         try:
             if os.path.exists(self.cache_file):
                 with open(self.cache_file, 'r', encoding='utf-8') as f:
                     logger.info(f"💾 Loading cache from file: {self.cache_file}")
-                    encoded_data = f.read()
-                    if not encoded_data:
-                         # Tenta di gestire il vecchio formato o ritorna default
+                    content = f.read()
+                    if not content:
                         return {'hosts': [], 'streams': {}}
                     
                     try:
-                        decoded_data = base64.b64decode(encoded_data).decode('utf-8')
-                        data = json.loads(decoded_data)
-                        
-                        # Retrocompatibilità: se la cache è il vecchio formato (dict di stream), convertilo
-                        if data and not ('hosts' in data and 'streams' in data):
-                             # Assumiamo che keys siano channel_ids
-                             # Verifica euristica: se le chiavi sono stringhe numeriche, è il vecchio formato
-                             is_old_format = any(k.isdigit() for k in data.keys())
-                             if is_old_format or not data:
-                                 logger.info("Detected old cache format, converting...")
-                                 return {'hosts': [], 'streams': data}
-                        
-                        return data
-                    except Exception:
-                        # Se fallisce decode, prova a leggerlo come JSON plain (fallback)
-                        f.seek(0)
-                        return json.load(f)
+                        # Prova prima JSON puro (nuovo formato)
+                        return json.loads(content)
+                    except json.JSONDecodeError:
+                        # Fallback: prova Base64 (vecchio formato)
+                        try:
+                            decoded_data = base64.b64decode(content).decode('utf-8')
+                            return json.loads(decoded_data)
+                        except Exception:
+                            logger.warning("⚠️ Cache file corrupted or invalid format.")
+                            return {'hosts': [], 'streams': {}}
 
-        except (IOError, json.JSONDecodeError, Exception) as e:
+        except (IOError, Exception) as e:
             logger.error(f"❌ Error loading cache: {e}. Starting with empty cache.")
         return {'hosts': [], 'streams': {}}
 
@@ -136,7 +136,7 @@ class DLHDExtractor:
         return self.session
 
     def _save_cache(self):
-        """Salva lo stato corrente della cache su un file, codificando il contenuto in Base64."""
+        """Salva lo stato corrente della cache su un file (formato JSON puro)."""
         try:
             with open(self.cache_file, 'w', encoding='utf-8') as f:
                 cache_data = {
@@ -146,11 +146,10 @@ class DLHDExtractor:
                     'stream_cdn_template': self.stream_cdn_template,
                     'stream_other_template': self.stream_other_template,
                     'server_lookup_url': self.server_lookup_url,
-                    'base_domain': self.base_domain
+                    'base_domain': self.base_domain,
+                    'lovecdn_url': self.lovecdn_url
                 }
-                json_data = json.dumps(cache_data)
-                encoded_data = base64.b64encode(json_data.encode('utf-8')).decode('utf-8')
-                f.write(encoded_data)
+                json.dump(cache_data, f, separators=(',', ':')) # Minified JSON
                 logger.info(f"💾 Cache (stream + hosts) saved successfully.")
         except IOError as e:
             logger.error(f"❌ Error saving cache: {e}")
@@ -186,9 +185,14 @@ class DLHDExtractor:
             headers['X-Secret-Key'] = secret_key
         return headers
 
-    async def _fetch_server_key(self, channel_key: str, iframe_url: str) -> str:
+    async def _fetch_server_key(self, channel_key: str, iframe_url: str, custom_lookup_url: str = None) -> str:
         """Fetch server key for a given channel."""
-        server_lookup_url = f"{self.server_lookup_url}?channel_id={channel_key}"
+        if custom_lookup_url:
+            server_lookup_url = custom_lookup_url
+        else:
+            server_lookup_url = f"{self.server_lookup_url}?channel_id={channel_key}"
+            
+        logger.info(f"🔎 Server lookup URL: {server_lookup_url}")
         iframe_origin = f"https://{urlparse(iframe_url).netloc}"
         lookup_headers = {
             'User-Agent': self.USER_AGENT,
@@ -235,8 +239,15 @@ class DLHDExtractor:
                         elif line.startswith('#BASE_DOMAIN:'):
                             self.base_domain = line.replace('#BASE_DOMAIN:', '').strip()
                             logger.info(f"✅ Base Domain aggiornato: {self.base_domain}")
+                        elif line.startswith('#LOVECDN_URL:'):
+                            self.lovecdn_url = line.replace('#LOVECDN_URL:', '').strip()
+                            logger.info(f"✅ LoveCDN URL aggiornato: {self.lovecdn_url}")
                         elif not line.startswith('#'):
-                            new_hosts.append(line)
+                             # Fix: se è un dominio "puro" (es. dlhd.link) non ha senso usarlo come iframe_url diretto se non supporta path.
+                             # Ma il worker ora manda anche URL completi.
+                             # Filtriamo linee vuote o non valide
+                            if len(line) > 3:
+                                new_hosts.append(line)
                     
                     if new_hosts:
                         self.iframe_hosts = new_hosts
@@ -382,193 +393,103 @@ class DLHDExtractor:
                     raise ExtractorError(f"Final error for {url}: {str(e)}")
         await asyncio.sleep(initial_delay)
 
-    async def extract(self, url: str, force_refresh: bool = False, **kwargs) -> Dict[str, Any]:
-        """Flusso di estrazione principale: estrae direttamente dall'iframe."""
+    async def _fetch_worker_config_for_channel(self, channel_id: str) -> Optional[str]:
+        """Richiede al worker la configurazione specifica per un canale (inclusi URL lovecdn)."""
+        encoded_url = "aHR0cHM6Ly9pZnJhbWUuZGxoZC5kcGRucy5vcmcv"
+        base_url = base64.b64decode(encoded_url).decode('utf-8')
+        # Costruisci URL con query string
+        url = f"{base_url}?id={channel_id}"
         
-        async def get_stream_data_direct(channel_id: str, hosts_to_try: list) -> Dict[str, Any]:
-            """Estrazione diretta dall'iframe senza passare per la pagina principale."""
-            last_error = None
-            for iframe_host in hosts_to_try:
+        logger.info(f"🔄 Fetching worker config for channel {channel_id}: {url}")
+        try:
+            session = await self._get_session()
+            async with session.get(url, ssl=False, timeout=ClientTimeout(total=10)) as response:
+                if response.status == 200:
+                    text = await response.text()
+                    lines = [line.strip() for line in text.splitlines() if line.strip()]
+                    lovecdn_found = None
+                    
+                    for line in lines:
+                        if line.startswith('#LOVECDN_URL:'):
+                            lovecdn_found = line.replace('#LOVECDN_URL:', '').strip()
+                            logger.info(f"✅ Found LoveCDN URL for channel {channel_id}: {lovecdn_found}")
+                        # Aggiorniamo anche le altre config se presenti, male non fa
+                        elif line.startswith('#AUTH_URL:'):
+                            self.auth_url = line.replace('#AUTH_URL:', '').strip()
+                        elif line.startswith('#STREAM_CDN_TEMPLATE:'):
+                            self.stream_cdn_template = line.replace('#STREAM_CDN_TEMPLATE:', '').strip()
+                        elif line.startswith('#STREAM_OTHER_TEMPLATE:'):
+                            self.stream_other_template = line.replace('#STREAM_OTHER_TEMPLATE:', '').strip()
+                    
+                    return lovecdn_found
+                else:
+                    logger.warning(f"⚠️ Worker returned status {response.status} for channel {channel_id}")
+        except Exception as e:
+            logger.error(f"❌ Error fetching worker config for {channel_id}: {e}")
+        return None
+
+
+    async def get_stream_data_direct(self, channel_id: str, hosts_to_try: list) -> Dict[str, Any]:
+        """Estrazione diretta dall'iframe senza passare per la pagina principale."""
+        last_error = None
+        
+        # Ensure we have a session
+        session = await self._get_session()
+        
+        for iframe_host in hosts_to_try:
+            iframe_host = iframe_host.strip()
+            try:
+                # Se iframe_url è un URL completo, non aggiungere altro
+                if iframe_host.startswith('http'):
+                     iframe_url = iframe_host
+                elif iframe_host.startswith('/'):
+                     continue
+                else:
+                     iframe_url = f'https://{iframe_host}/premiumtv/daddyhd.php?id={channel_id}'
+                     
+                # Fix: se l'URL del worker ha già un ID (es id=877) ma noi cerchiamo un altro canale,
+                # dobbiamo sostituire l'ID.
+                if 'id=' in iframe_url and f'id={channel_id}' not in iframe_url:
+                    iframe_url = re.sub(r'id=\d+', f'id={channel_id}', iframe_url)
+                
+                iframe_url = iframe_url.strip()
+                
+                embed_headers = {
+                    'User-Agent': self.USER_AGENT,
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Referer': 'https://dlhd.dad/',
+                }
+                
+                # Step 1: Fetch iframe page using robust request (reuses session)
+                resp = await self._make_robust_request(iframe_url, headers=embed_headers, retries=1) # Reduced retries for speed
+                js_content = await resp.text()
+                
+                # Check if it's lovecdn (including lovetier.bz or other variants)
+                if 'lovecdn.ru' in js_content or 'lovetier.bz' in js_content:
+                    logger.info("Detected lovecdn.ru/lovetier.bz content - using alternative extraction")
+                    return await self._extract_lovecdn_stream(iframe_url, js_content)
+                
+                # PRIORITY: Try new heuristic flow first (EPlayerAuth / obfuscated)
                 try:
-                    iframe_url = f'https://{iframe_host}/premiumtv/daddyhd.php?id={channel_id}'
-                    logger.info(f"🔍 Attempting extraction from: {iframe_url}")
-                    
-                    embed_headers = {
-                        'User-Agent': self.USER_AGENT,
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                        'Accept-Language': 'en-US,en;q=0.9',
-                        'Referer': 'https://dlhd.dad/',
-                        'sec-ch-ua': '"Chromium";v="136", "Google Chrome";v="136"',
-                        'sec-ch-ua-mobile': '?0',
-                        'sec-ch-ua-platform': '"macOS"',
-                    }
-                    
-                    # Step 1: Fetch iframe page
-                    resp = await self._make_robust_request(iframe_url, headers=embed_headers, retries=2)
-                    js_content = await resp.text()
-                    
-                    # Check if it's lovecdn
-                    if 'lovecdn.ru' in js_content:
-                        logger.info("Detected lovecdn.ru content - using alternative extraction")
-                        result = await self._extract_lovecdn_stream(iframe_url, js_content)
+                    result = await self._extract_new_auth_flow(iframe_url, js_content)
+                    if result:
                         return result
+                except Exception:
+                    pass
                     
-                    # Step 2: Extract auth params
-                    params = {}
-                    patterns = {
-                        'channel_key': r'(?:const|var|let)\s+(?:CHANNEL_KEY|channelKey)\s*=\s*["\']([^"\']+)["\']',
-                        'auth_token': r'(?:const|var|let)\s+AUTH_TOKEN\s*=\s*["\']([^"\']+)["\']',
-                        'auth_country': r'(?:const|var|let)\s+AUTH_COUNTRY\s*=\s*["\']([^"\']+)["\']',
-                        'auth_ts': r'(?:const|var|let)\s+AUTH_TS\s*=\s*["\']([^"\']+)["\']',
-                        'auth_expiry': r'(?:const|var|let)\s+AUTH_EXPIRY\s*=\s*["\']([^"\']+)["\']',
-                    }
-                    for key, pattern in patterns.items():
-                        match = re.search(pattern, js_content)
-                        params[key] = match.group(1) if match else None
-                    
-                    missing_params = [k for k, v in params.items() if not v]
-                    if missing_params:
-                        logger.warning(f"⚠️ Missing parameters from {iframe_host}: {missing_params}. Attempting new heuristic flow...")
-                        try:
-                            # Se mancano i parametri standard, prova il nuovo flusso euristico/obfuscated
-                            result = await self._extract_new_auth_flow(iframe_url, js_content)
-                            return result
-                        except Exception as e:
-                            logger.warning(f"⚠️ Nuovo flusso fallito: {e}")
-                            last_error = ExtractorError(f"Missing params: {missing_params} and New Flow failed")
-                            continue
-                    
-                    logger.info(f"✅ Parameters extracted: channel_key={params['channel_key']}")
-                    
-                    # Step 3: Auth POST
-                    # ✅ DINAMICO: usa self.auth_url completo
-                    auth_url = self.auth_url
-                    logger.info(f"🔐 Using auth_url: {auth_url}")
-                    iframe_origin = f"https://{iframe_host}"
-                    
-                    form_data = FormData()
-                    form_data.add_field('channelKey', params['channel_key'])
-                    form_data.add_field('country', params['auth_country'])
-                    form_data.add_field('timestamp', params['auth_ts'])
-                    form_data.add_field('expiry', params['auth_expiry'])
-                    form_data.add_field('token', params['auth_token'])
-                    
-                    auth_headers = {
-                        'User-Agent': self.USER_AGENT,
-                        'Accept': '*/*',
-                        'Accept-Language': 'en-US,en;q=0.9',
-                        'Content-Type': 'application/x-www-form-urlencoded',
-                        'Origin': iframe_origin,
-                        'Referer': iframe_url,
-                        'Sec-Fetch-Dest': 'empty',
-                        'Sec-Fetch-Mode': 'cors',
-                        'Sec-Fetch-Site': 'cross-site',
-                        'sec-ch-ua': '"Chromium";v="136", "Google Chrome";v="136"',
-                        'sec-ch-ua-mobile': '?0',
-                        'sec-ch-ua-platform': '"macOS"',
-                    }
-                    
-                    session = await self._get_session()
-                    async with session.post(auth_url, data=form_data, headers=auth_headers, ssl=False) as auth_resp:
-                        auth_text = await auth_resp.text()
-                        logger.info(f"Auth response: {auth_resp.status} - {auth_text[:100]}")
-                        
-                        if auth_resp.status != 200 or 'Blocked' in auth_text or 'bad params' in auth_text.lower():
-                            logger.warning(f"⚠️ Auth bloccato da {iframe_host}: {auth_text[:50]}")
-                            
-                            
-                            # ✅ NUOVO: Se è il primo host e auth fallisce, prova a refreshare config
-                            if iframe_host == hosts_to_try[0] and not getattr(self, '_config_refreshed', False):
-                                logger.info("🔄 Auth fallito, provo ad aggiornare config dal worker...")
-                                self._config_refreshed = True
-                                if await self._fetch_iframe_hosts():
-                                    # Aggiorna auth_url per il prossimo tentativo
-                                    auth_url = self.auth_url
-                                    logger.info(f"✅ Config aggiornata, nuovo auth_url: {auth_url}")
-                            
-                            # ✅ TENTATIVO NUOVO FLUSSO se Auth fallisce (es. token invalidi)
-                            logger.warning("⚠️ Auth fallito con metodo standard. Tento nuovo flusso euristico...")
-                            try:
-                                result = await self._extract_new_auth_flow(iframe_url, js_content)
-                                return result
-                            except Exception as e:
-                                logger.warning(f"⚠️ Nuovo flusso (fallback) fallito: {e}")
-                                last_error = ExtractorError(f"Auth blocked: {auth_text} AND New Flow failed: {e}")
-                                continue
-                        
-                        try:
-                            auth_data = json.loads(auth_text)
-                            if not (auth_data.get('success') or auth_data.get('valid')):
-                                logger.warning(f"⚠️ Auth fallito: {auth_data}")
-                                last_error = ExtractorError(f"Auth failed: {auth_data}")
-                                continue
-                        except json.JSONDecodeError:
-                            last_error = ExtractorError(f"Auth response not JSON: {auth_text}")
-                            continue
-                    
-                    logger.info("✅ Auth successful!")
-                    
-                    # ✅ DEBUG: Log cookies e headers dalla risposta auth
-                    auth_cookies = auth_resp.cookies
-                    logger.info(f"🍪 Cookies dalla risposta auth: {dict(auth_cookies)}")
-                    logger.info(f"📋 Headers dalla risposta auth: {dict(auth_resp.headers)}")
-                    
-                    # Log tutti i cookies nella session dopo auth
-                    all_session_cookies = list(session.cookie_jar)
-                    logger.info(f"🍪 Tutti i cookies nella sessione dopo auth: {all_session_cookies}")
-                    
-                    # Step 4: Server Lookup
-                    server_key = await self._fetch_server_key(params['channel_key'], iframe_url)
-                    logger.info(f"✅ Server key: {server_key}")
+                # Se il nuovo flusso fallisce, passiamo al prossimo host
+                last_error = ExtractorError(f"New flow failed on {iframe_host}")
+                continue
+                
+            except Exception as e:
+                # logger.warning(f"⚠️ Error with {iframe_host}: {e}") # Reduce logging noise
+                last_error = e
+                continue
+        
+        raise ExtractorError(f"All iframe hosts failed. Last error: {last_error}")
 
-                    channel_key = params['channel_key']
-                    auth_token = params['auth_token']
-
-                    # Build final URL using helper method
-                    stream_url = self._build_stream_url(server_key, channel_key)
-                    logger.info(f"✅ Stream URL costruito: {stream_url}")
-
-                    # Build headers using helper method
-                    stream_headers = self._build_stream_headers(iframe_url, channel_key, auth_token)
-                    stream_headers['X-User-Agent'] = self.USER_AGENT  # Add for compatibility
-
-                    # ✅ Aggiungi cookies dalla sessione corrente
-                    if self.session:
-                        # Log all cookies for debugging
-                        all_cookies = list(self.session.cookie_jar)
-                        logger.info(f"🍪 All cookies in jar: {all_cookies}")
-                        
-                        cookies = self.session.cookie_jar.filter_cookies(stream_url)
-                        cookie_str = "; ".join([f"{k}={v.value}" for k, v in cookies.items()])
-                        if cookie_str:
-                            stream_headers['Cookie'] = cookie_str
-                            logger.info(f"🍪 Cookies added to headers: {cookie_str[:50]}...")
-
-                    expires_at = None
-                    try:
-                        if params.get('auth_expiry'):
-                            expires_at = float(params['auth_expiry'])
-                            logger.info(f"⏳ Auth Expiry: {expires_at} (Current time: {time.time()})")
-                    except (ValueError, TypeError):
-                        pass
-                    
-                    # ✅ Reset flag per permettere futuri refresh
-                    self._config_refreshed = False
-                    
-                    return {
-                        "destination_url": stream_url,
-                        "request_headers": stream_headers,
-                        "mediaflow_endpoint": self.mediaflow_endpoint,
-                        "expires_at": expires_at
-                    }
-                    
-                except Exception as e:
-                    logger.warning(f"⚠️ Error with {iframe_host}: {e}")
-                    last_error = e
-                    continue
-            
-            raise ExtractorError(f"All iframe hosts failed. Last error: {last_error}")
-
+    async def extract(self, url: str, force_refresh: bool = False, **kwargs) -> Dict[str, Any]:
         try:
             channel_id = self.extract_channel_id(url)
             if not channel_id:
@@ -585,23 +506,47 @@ class DLHDExtractor:
                 expires_at = cached_data.get("expires_at")
 
                 is_valid = False
-                
+                current_time = time.time()
+
                 # ✅ Check expiry first (con buffer di 30 secondi)
-                if expires_at and time.time() > (expires_at - 30):
+                if expires_at and current_time > (expires_at - 30):
                      logger.warning(f"⚠️ Cache expired for channel ID {channel_id} (expires_at: {expires_at}).")
                      is_valid = False
-                elif stream_url:
-                    try:
-                        async with aiohttp.ClientSession(timeout=ClientTimeout(total=10)) as validation_session:
-                            async with validation_session.head(stream_url, headers=stream_headers, ssl=False) as response:
-                                if response.status == 200:
-                                    is_valid = True
-                                    logger.info(f"✅ Cache for channel ID {channel_id} is valid.")
-                                else:
-                                    logger.warning(f"⚠️ Cache for channel ID {channel_id} not valid. Status: {response.status}. Proceeding with extraction.")
-                    except Exception as e:
-                        logger.warning(f"⚠️ Error during cache validation for {channel_id}: {e}. Proceeding with extraction.")
-                
+                elif cached_data.get("_source") == "standard":
+                     # Check cooldown for LoveCDN retry
+                     last_fail = self._lovecdn_failure_time.get(channel_id, 0)
+                     if current_time - last_fail > 120: # 2 minutes cooldown
+                         logger.info(f"⏳ LoveCDN cooldown expired for {channel_id}. Ignoring standard cache to retry LoveCDN.")
+                         is_valid = False
+                     else:
+                         # Still in cooldown, use standard
+                         is_valid = True
+                         logger.info(f"⏳ Using cached standard stream (LoveCDN cooldown active for {int(120 - (current_time - last_fail))}s)")
+                else:
+                    # ✅ Only validate with HEAD request if we're within 5 minutes of expiry
+                    # This reduces unnecessary network requests for fresh cache entries
+                    time_until_expiry = expires_at - current_time if expires_at else float('inf')
+                    validation_threshold = 300  # 5 minutes
+
+                    if time_until_expiry < validation_threshold:
+                        logger.info(f"🔍 Cache expires in {int(time_until_expiry)}s, validating with HEAD request...")
+                        try:
+                            # ✅ Use persistent session for cache validation instead of creating new one
+                            session = await self._get_session()
+                            async with session.head(stream_url, headers=stream_headers, ssl=False, timeout=ClientTimeout(total=10)) as response:
+                                    if response.status == 200:
+                                        is_valid = True
+                                        logger.info(f"✅ Cache for channel ID {channel_id} is valid.")
+                                    else:
+                                        logger.warning(f"⚠️ Cache for channel ID {channel_id} not valid. Status: {response.status}. Proceeding with extraction.")
+                        except Exception as e:
+                            logger.warning(f"⚠️ Error during cache validation for {channel_id}: {e}. Proceeding with extraction.")
+                    else:
+                        # Cache is fresh enough, skip validation
+                        is_valid = True
+                        expiry_str = "infinity" if time_until_expiry == float('inf') else f"{int(time_until_expiry)}s"
+                        logger.info(f"✅ Cache for channel ID {channel_id} is valid (expires in {expiry_str}, skipping validation).")
+
                 if not is_valid:
                     if channel_id in self._stream_data_cache:
                         del self._stream_data_cache[channel_id]
@@ -629,21 +574,79 @@ class DLHDExtractor:
                         return self._stream_data_cache[channel_id]
 
                 # Procedi con l'estrazione diretta
-                # Procedi con l'estrazione diretta
                 logger.info(f"⚙️ No valid cache for {channel_id}, starting direct extraction...")
                 
+                # Check LoveCDN cooldown
+                last_fail = self._lovecdn_failure_time.get(channel_id, 0)
+                lovecdn_url = None
+                
+                if time.time() - last_fail < 120:
+                    logger.info(f"⏳ LoveCDN in cooldown (failed {int(time.time() - last_fail)}s ago). Skipping worker check.")
+                else:
+                    lovecdn_url = await self._fetch_worker_config_for_channel(channel_id)
+
+                if lovecdn_url:
+                    logger.info(f"✅ Worker provided LoveCDN URL: {lovecdn_url}. Using as primary extraction method.")
+                    try:
+                        session = await self._get_session()
+                        headers = self.base_headers.copy()
+                        headers['Referer'] = 'https://dlhd.link/' 
+                        async with session.get(lovecdn_url, headers=headers, ssl=False) as resp:
+                            if resp.status == 200:
+                                content = await resp.text()
+                                result = await self._extract_lovecdn_stream(lovecdn_url, content)
+                                
+                                # Validate stream URL
+                                stream_url = result.get("destination_url")
+                                stream_headers = result.get("request_headers", {})
+                                
+                                logger.info(f"🔍 Verifying LoveCDN stream URL: {stream_url}")
+                                try:
+                                    # Use a short timeout for validation
+                                    validation_timeout = ClientTimeout(total=5)
+                                    async with session.get(stream_url, headers=stream_headers, ssl=False, timeout=validation_timeout) as stream_resp:
+                                        if stream_resp.status == 200:
+                                            # Read a small chunk to verify it's a playlist
+                                            content_check = await stream_resp.read()
+                                            content_str = content_check.decode('utf-8', errors='ignore')
+                                            
+                                            if "#EXTM3U" in content_str:
+                                                logger.info(f"✅ LoveCDN stream URL verified (200 OK + Valid M3U8).")
+                                                result["_source"] = "lovecdn"
+                                                # Clear any failure record
+                                                self._lovecdn_failure_time.pop(channel_id, None)
+                                                self._stream_data_cache[channel_id] = result
+                                                self._save_cache()
+                                                return result
+                                            else:
+                                                logger.warning(f"⚠️ LoveCDN stream URL returned 200 but content doesn't look like M3U8. Content start: {content_str[:50]}")
+                                                self._lovecdn_failure_time[channel_id] = time.time()
+                                        else:
+                                            logger.warning(f"⚠️ LoveCDN stream URL verification failed. Status: {stream_resp.status}")
+                                            self._lovecdn_failure_time[channel_id] = time.time()
+                                except Exception as e:
+                                    logger.warning(f"⚠️ LoveCDN stream URL verification failed with error: {e}")
+                                    self._lovecdn_failure_time[channel_id] = time.time()
+                            else:
+                                logger.warning(f"⚠️ LoveCDN URL returned status {resp.status}. Falling back to standard hosts.")
+                                self._lovecdn_failure_time[channel_id] = time.time()
+                    except Exception as e:
+                        logger.error(f"❌ Failed to extract from worker-provided LoveCDN URL: {e}. Falling back to standard hosts.")
+                        self._lovecdn_failure_time[channel_id] = time.time()
+                
+                # Se lovecdn non c'è o fallisce, procedi con metodo standard
                 try:
-                    result = await get_stream_data_direct(channel_id, self.iframe_hosts)
+                    result = await self.get_stream_data_direct(channel_id, self.iframe_hosts)
                 except ExtractorError:
                     # Se fallisce con gli host correnti, prova ad aggiornarli
                     logger.warning("⚠️ All current hosts failed. Attempting to update host list...")
                     if await self._fetch_iframe_hosts():
-                         logger.info(f"🔄 Retrying with new hosts: {self.iframe_hosts}")
-                         result = await get_stream_data_direct(channel_id, self.iframe_hosts)
+                         result = await self.get_stream_data_direct(channel_id, self.iframe_hosts)
                     else:
                         raise
                 
                 # Salva in cache
+                result["_source"] = "standard"
                 self._stream_data_cache[channel_id] = result
                 self._save_cache()
                 
@@ -663,20 +666,43 @@ class DLHDExtractor:
         Estrattore alternativo per iframe lovecdn.ru che usa un formato diverso.
         """
         try:
+            # Check for nested iframe (e.g. lovetier.bz)
+            # Example: <iframe ... src="https://lovetier.bz/player/ZonaDAZN"></iframe>
+            nested_iframe_match = re.search(r'<iframe[^>]+src=["\']([^"\']+)["\']', iframe_content, re.IGNORECASE)
+            if nested_iframe_match:
+                nested_url = nested_iframe_match.group(1)
+                if not nested_url.startswith('http'):
+                     nested_url = urljoin(iframe_url, nested_url)
+                
+                logger.info(f"Found nested iframe in lovecdn: {nested_url}")
+                try:
+                    # Fetch the nested iframe content
+                    # Use a new session or the existing one? Use robust request.
+                    resp = await self._make_robust_request(nested_url, headers={'Referer': iframe_url}, retries=2)
+                    iframe_content = await resp.text()
+                    iframe_url = nested_url # Update context
+                except Exception as e:
+                    logger.warning(f"Failed to fetch nested iframe {nested_url}: {e}")
+                    # Continue with original content if failed (might be direct stream)
+
             # Cerca pattern di stream URL diretto
             m3u8_patterns = [
                 r'["\']([^"\']*\.m3u8[^"\']*)["\']',
                 r'source[:\s]+["\']([^"\']+)["\']',
                 r'file[:\s]+["\']([^"\']+\.m3u8[^"\']*)["\']',
                 r'hlsManifestUrl[:\s]*["\']([^"\']+)["\']',
+                r'streamUrl[:\s]+["\']([^"\']+)["\']', # Added for lovetier config
             ]
             
             stream_url = None
             for pattern in m3u8_patterns:
                 matches = re.findall(pattern, iframe_content)
                 for match in matches:
-                    if '.m3u8' in match and match.startswith('http'):
-                        stream_url = match
+                    # Handle escaped slashes (e.g. https:\/\/...)
+                    clean_match = match.replace('\\/', '/')
+                    
+                    if '.m3u8' in clean_match and clean_match.startswith('http'):
+                        stream_url = clean_match
                         logger.info(f"Found direct m3u8 URL: {stream_url}")
                         break
                 if stream_url:
@@ -766,9 +792,9 @@ class DLHDExtractor:
         # Case A: let _var="part1"+"part2"+...;
         # Case B: const _array=["part1","part2",...];let _var=_array.map(x=>x).join('');
 
-        # Pattern to find the line with "let _varname="
-        let_pattern = rf'let\s+{re.escape(secret_var_name)}\s*='
-        let_match = re.search(let_pattern, iframe_html)
+        # Pattern to find the line with "const _varname=" or "let _varname="
+        const_pattern = rf'(?:let|const)\s+{re.escape(secret_var_name)}\s*='
+        let_match = re.search(const_pattern, iframe_html)
 
         if not let_match:
             return None
@@ -814,6 +840,52 @@ class DLHDExtractor:
 
         return None
 
+    def _extract_eplayer_auth_data(self, iframe_html: str) -> dict | None:
+        """
+        Extract auth_token, channel_key, and channel_salt from EPlayerAuth.init block.
+
+        The EPlayerAuth.init block has this format:
+        EPlayerAuth.init({
+            authToken: 'premium860|IT|1769803458|1769889858|98cdbdf2b86c8c63a5fe59d779b3a33e976613d0ec726e74225ed469567eb3c3',
+            channelKey: 'premium860',
+            country: 'IT',
+            timestamp: 1769803458,
+            validDomain: 'codepcplay.fun',
+            channelSalt: '5a64ab0085fb21c0402b6fcf3d753c3a91b660644c5afa186e046c9ca702bf4a'
+        });
+
+        Args:
+            iframe_html: The HTML content from the iframe URL
+
+        Returns:
+            Dict with auth_token, channel_key, channel_salt, server_lookup_url or None
+        """
+        # Pattern to extract EPlayerAuth.init block parameters
+        # Relaxed pattern: search for keys anywhere in the content with flexible quotes
+        auth_pattern = r"authToken:\s*['\"]([^'\"]+)['\"]"
+        channel_key_pattern = r"channelKey:\s*['\"]([^'\"]+)['\"]"
+        channel_salt_pattern = r"channelSalt:\s*['\"]([^'\"]+)['\"]"
+
+        # Pattern to extract server lookup base URL from fetchWithRetry call
+        lookup_pattern = r"fetchWithRetry\s*\(\s*['\"]([^'\"]+server_lookup\?channel_id=)"
+
+        auth_match = re.search(auth_pattern, iframe_html)
+        channel_key_match = re.search(channel_key_pattern, iframe_html)
+        channel_salt_match = re.search(channel_salt_pattern, iframe_html)
+        lookup_match = re.search(lookup_pattern, iframe_html)
+
+        if auth_match and channel_key_match and channel_salt_match:
+            result = {
+                "auth_token": auth_match.group(1),
+                "channel_key": channel_key_match.group(1),
+                "channel_salt": channel_salt_match.group(1),
+            }
+            if lookup_match:
+                result["server_lookup_url"] = lookup_match.group(1) + result["channel_key"]
+
+            return result
+
+        return None
 
     def _extract_obfuscated_session_data(self, iframe_html: str) -> dict | None:
         """
@@ -862,44 +934,61 @@ class DLHDExtractor:
 
         logger.info("Tentativo rilevamento nuovo flusso auth obfuscated...")
 
-        # 1. Prima prova l'estrazione strutturata per pattern obfuscati (var_[a-f0-9]+)
-        obfuscated_data = self._extract_obfuscated_session_data(iframe_content)
+        # 1. First try EPlayerAuth.init extraction (new method)
+        eplayer_data = self._extract_eplayer_auth_data(iframe_content)
 
         params = {}
         secret_key = None
+        server_lookup_url = None
+        data_found = False
 
-        if obfuscated_data:
-            logger.info("✅ Rilevato pattern obfuscated (var_xxx)")
-            params['auth_token'] = obfuscated_data.get('session_token')
-            params['channel_key'] = obfuscated_data.get('channel_key')
-            secret_key = obfuscated_data.get('secret_key')
+        if eplayer_data:
+            logger.info("✅ Rilevato pattern EPlayerAuth.init")
+            params['auth_token'] = eplayer_data.get('auth_token')
+            params['channel_key'] = eplayer_data.get('channel_key')
+            secret_key = eplayer_data.get('channel_salt')
+            server_lookup_url = eplayer_data.get('server_lookup_url')
+            data_found = True
             if secret_key:
-                logger.info(f"✅ Secret key estratta per calcolo nonce")
+                logger.info(f"✅ Channel salt estratto per calcolo nonce")
         else:
-            # Fallback: estrazione euristica originale
-            logger.info("Pattern obfuscated non trovato, provo estrazione euristica...")
+            # 2. Fallback to obfuscated extraction (var_[a-f0-9]+)
+            obfuscated_data = self._extract_obfuscated_session_data(iframe_content)
 
-            # Cerca il JWT (inizia con eyJ...)
-            jwt_match = re.search(r'["\'](eyJ[a-zA-Z0-9\-_]+\.[a-zA-Z0-9\-_]+\.[a-zA-Z0-9\-_]+)["\']', iframe_content)
-            if jwt_match:
-                params['auth_token'] = jwt_match.group(1)
-                logger.info("✅ Trovato possibile JWT Token")
-
-            # Cerca Channel Key (es: premium853) - o stringa alfanumerica di media lunghezza
-            key_matches = re.finditer(r'["\']([a-z]+[0-9]+)["\']', iframe_content)
-            for m in key_matches:
-                val = m.group(1)
-                # Filtro euristico: deve sembrare una chiave canale
-                if re.match(r'^(premium|dad|sport|live)[0-9]+$', val):
-                    params['channel_key'] = val
-                    logger.info(f"✅ Trovata possibile Channel Key: {val}")
-                    break
-
-            # Prova a estrarre secret_key anche con estrazione euristica
-            if params.get('channel_key'):
-                secret_key = self._extract_secret_key(iframe_content, params['channel_key'])
+            if obfuscated_data:
+                logger.info("✅ Rilevato pattern obfuscated (var_xxx)")
+                params['auth_token'] = obfuscated_data.get('session_token')
+                params['channel_key'] = obfuscated_data.get('channel_key')
+                secret_key = obfuscated_data.get('secret_key')
+                server_lookup_url = obfuscated_data.get('server_lookup_url')
+                data_found = True
                 if secret_key:
-                    logger.info(f"✅ Secret key estratta (fallback)")
+                    logger.info(f"✅ Secret key estratta per calcolo nonce")
+            else:
+                # Fallback: estrazione euristica originale
+                logger.info("Pattern obfuscated non trovato, provo estrazione euristica...")
+
+                # Cerca il JWT (inizia con eyJ...)
+                jwt_match = re.search(r'["\'](eyJ[a-zA-Z0-9\-_]+\.[a-zA-Z0-9\-_]+\.[a-zA-Z0-9\-_]+)["\']', iframe_content)
+                if jwt_match:
+                    params['auth_token'] = jwt_match.group(1)
+                    logger.info("✅ Trovato possibile JWT Token")
+
+                # Cerca Channel Key (es: premium853) - o stringa alfanumerica di media lunghezza
+                key_matches = re.finditer(r'["\']([a-z]+[0-9]+)["\']', iframe_content)
+                for m in key_matches:
+                    val = m.group(1)
+                    # Filtro euristico: deve sembrare una chiave canale
+                    if re.match(r'^(premium|dad|sport|live)[0-9]+$', val):
+                        params['channel_key'] = val
+                        logger.info(f"✅ Trovata possibile Channel Key: {val}")
+                        break
+
+                # Prova a estrarre secret_key anche con estrazione euristica
+                if params.get('channel_key'):
+                    secret_key = self._extract_secret_key(iframe_content, params['channel_key'])
+                    if secret_key:
+                        logger.info(f"✅ Secret key estratta (fallback)")
 
         # Cerca Country (2 lettere maiuscole)
         country_match = re.search(r'["\']([A-Z]{2})["\']', iframe_content)
@@ -908,8 +997,12 @@ class DLHDExtractor:
         else:
             params['auth_country'] = 'DE'  # Fallback
 
-        # Cerca Timestamp (10 cifre)
+        # Cerca Timestamp (10 cifre) - sia quotato che non (es: timestamp: 1234567890)
         ts_matches = re.findall(r'["\']([0-9]{10})["\']', iframe_content)
+        # Aggiungi ricerca per timestamp numerici non quotati (comuni in EPlayerAuth)
+        ts_numeric = re.findall(r'timestamp:\s*([0-9]{10})', iframe_content)
+        ts_matches.extend(ts_numeric)
+        
         if ts_matches:
             ts_values = sorted([int(x) for x in ts_matches])
             params['auth_ts'] = str(ts_values[0])
@@ -940,7 +1033,7 @@ class DLHDExtractor:
         auth_token = params['auth_token']
 
         # 3. Server Lookup - use helper method
-        server_key = await self._fetch_server_key(channel_key, iframe_url)
+        server_key = await self._fetch_server_key(channel_key, iframe_url, custom_lookup_url=server_lookup_url)
         logger.info(f"✅ Server key: {server_key}")
 
         # Build Stream URL - use helper method
