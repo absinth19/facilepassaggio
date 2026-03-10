@@ -168,7 +168,7 @@ class SportsonlineExtractor:
             logger.info(f"Found iframe URL: {iframe_url}")
 
             iframe_headers = {
-                'Referer': 'https://sportzonline.st/',
+                'Referer': url,
                 'User-Agent': self.base_headers['user-agent'],
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                 'Accept-Language': 'en-US,en;q=0.9,it;q=0.8',
