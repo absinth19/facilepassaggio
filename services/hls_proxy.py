@@ -80,7 +80,9 @@ if MPD_MODE == "legacy":
     StreamWishExtractor,
     SupervideoExtractor,
     UqloadExtractor,
-) = None, None, None, None, None
+    DroploadExtractor,
+    VixCloudExtractor,
+) = None, None, None, None, None, None, None
 (
     VidmolyExtractor,
     VidozaExtractor,
@@ -91,52 +93,15 @@ if MPD_MODE == "legacy":
 
 logger = logging.getLogger(__name__)
 
-# Sportsonline host variants (including frequent typos)
-_SPORTSONLINE_EXACT_LABELS = {
-    "sportzsonline",
-    "sportzonline",
-    "sportsonline",
-    "sprtsonline",
-    "sportsnline",
-}
-_SPORTSONLINE_FALLBACK_LABEL_RE = re.compile(r"sp(?:o)?rt(?:s|z)?s?(?:o)?nline")
-
-
-def _iter_normalized_hostname_labels(value: str) -> list[str]:
-    if not value:
-        return []
-
-    raw_value = value.strip().lower()
-    parsed = urlparse(raw_value)
-    hostname = parsed.hostname
-
-    # Handle inputs like "sportzsonline.click" without scheme.
-    if not hostname and "://" not in raw_value:
-        hostname = urlparse(f"//{raw_value}").hostname
-
-    if not hostname:
-        hostname = raw_value
-
-    labels = []
-    for label in hostname.split("."):
-        normalized = re.sub(r"[^a-z]", "", label)
-        if normalized:
-            labels.append(normalized)
-
-    return labels
+_SPORTSONLINE_PATH_PATTERNS = (
+    re.compile(r"/channels/[a-z0-9_-]+/[a-z0-9_-]+\.php(?:$|[?#])", re.IGNORECASE),
+    re.compile(r"/hd/hd\d+\.php(?:$|[?#])", re.IGNORECASE),
+)
 
 
 def _is_sportsonline_candidate(value: str) -> bool:
-    for label in _iter_normalized_hostname_labels(value):
-        if label in _SPORTSONLINE_EXACT_LABELS:
-            return True
-        if (
-            label.startswith("sp")
-            and (label.endswith("online") or label.endswith("nline"))
-            and _SPORTSONLINE_FALLBACK_LABEL_RE.fullmatch(label)
-        ):
-            return True
-    return False
+    raw_value = (value or "").strip().lower()
+    return any(pattern.search(raw_value) for pattern in _SPORTSONLINE_PATH_PATTERNS)
 
 
 def _resolve_sportsonline_proxy(url: str) -> str | None:
@@ -295,6 +260,20 @@ except ImportError:
     logger.warning("⚠️ UqloadExtractor module not found.")
 
 try:
+    from extractors.dropload import DroploadExtractor
+
+    logger.info("DroploadExtractor module loaded.")
+except ImportError:
+    logger.warning("DroploadExtractor module not found.")
+
+try:
+    from extractors.vixcloud import VixCloudExtractor
+
+    logger.info("VixCloudExtractor module loaded.")
+except ImportError:
+    logger.warning("VixCloudExtractor module not found.")
+
+try:
     from extractors.vidmoly import VidmolyExtractor
 
     logger.info("✅ VidmolyExtractor module loaded.")
@@ -328,6 +307,13 @@ try:
     logger.info("✅ F16PxExtractor module loaded.")
 except ImportError:
     logger.warning("⚠️ F16PxExtractor module not found.")
+
+try:
+    from extractors.dlstreams import DLStreamsExtractor
+
+    logger.info("✅ DLStreamsExtractor module loaded.")
+except ImportError:
+    logger.warning("⚠️ DLStreamsExtractor module not found.")
 
 
 class HLSProxy:
@@ -503,6 +489,26 @@ class HLSProxy:
         session = await self._get_session(prefer_default_family=prefer_default_family)
         return session, None
 
+    @staticmethod
+    def _query_flag_is_true(value: str | None) -> bool:
+        if value is None:
+            return False
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _should_force_direct_from_query(self, request) -> bool:
+        direct_param = request.query.get("direct")
+        if self._query_flag_is_true(direct_param):
+            return True
+
+        for param_name, param_value in request.query.items():
+            if not param_name.startswith("h_"):
+                continue
+            header_name = param_name[2:].replace("_", "-").lower()
+            if header_name in {"x-direct-connection", "x-force-direct"}:
+                return self._query_flag_is_true(param_value)
+
+        return False
+
     async def get_extractor(self, url: str, request_headers: dict, host: str = None):
         """Ottiene l'estrattore appropriato per l'URL"""
         try:
@@ -523,6 +529,12 @@ class HLSProxy:
                             request_headers, proxies=GLOBAL_PROXIES
                         )
                     return self.extractors[key]
+                elif host == "vixcloud":
+                    if key not in self.extractors:
+                        self.extractors[key] = VixCloudExtractor(
+                            request_headers, proxies=GLOBAL_PROXIES
+                        )
+                    return self.extractors[key]
                 elif _is_sportsonline_candidate(host):
                     key = "sportsonline"
                     if key not in self.extractors:
@@ -530,7 +542,7 @@ class HLSProxy:
                             request_headers, proxies=GLOBAL_PROXIES
                         )
                     return self.extractors[key]
-                elif host == "mixdrop":
+                elif host in {"mixdrop", "m1xdrop"}:
                     if key not in self.extractors:
                         self.extractors[key] = MixdropExtractor(
                             request_headers, proxies=GLOBAL_PROXIES
@@ -617,6 +629,12 @@ class HLSProxy:
                             request_headers, proxies=GLOBAL_PROXIES
                         )
                     return self.extractors[key]
+                elif host == "dropload":
+                    if key not in self.extractors:
+                        self.extractors[key] = DroploadExtractor(
+                            request_headers, proxies=GLOBAL_PROXIES
+                        )
+                    return self.extractors[key]
                 elif host == "uqload":
                     if key not in self.extractors:
                         self.extractors[key] = UqloadExtractor(
@@ -677,6 +695,17 @@ class HLSProxy:
                         request_headers, proxies=proxy_list
                     )
                 return self.extractors[key]
+            elif "vixcloud.co/" in url.lower() and any(
+                x in url.lower() for x in ["/embed/", "/playlist/"]
+            ):
+                key = "vixcloud"
+                proxy = get_proxy_for_url("vixcloud.co", TRANSPORT_ROUTES, GLOBAL_PROXIES)
+                proxy_list = [proxy] if proxy else []
+                if key not in self.extractors:
+                    self.extractors[key] = VixCloudExtractor(
+                        request_headers, proxies=proxy_list
+                    )
+                return self.extractors[key]
             elif _is_sportsonline_candidate(url):
                 key = "sportsonline"
                 proxy = _resolve_sportsonline_proxy(url)
@@ -686,7 +715,7 @@ class HLSProxy:
                         request_headers, proxies=proxy_list
                     )
                 return self.extractors[key]
-            elif "mixdrop" in url:
+            elif "mixdrop" in url or "m1xdrop" in url:
                 key = "mixdrop"
                 proxy = get_proxy_for_url("mixdrop", TRANSPORT_ROUTES, GLOBAL_PROXIES)
                 proxy_list = [proxy] if proxy else []
@@ -801,6 +830,22 @@ class HLSProxy:
                         request_headers, proxies=proxy_list
                     )
                 return self.extractors[key]
+            elif (
+                # Rileva per dominio noto (aggiorna qui se cambia)
+                "dlhd.dad" in url
+                # Rileva per pattern URL stabile (/watch.php?id=NNN)
+                or (re.search(r'/watch\.php\?.*id=\d+', url) is not None)
+            ):
+                key = "dlstreams"
+                proxy = get_proxy_for_url(
+                    "dlhd.dad", TRANSPORT_ROUTES, GLOBAL_PROXIES
+                )
+                proxy_list = [proxy] if proxy else []
+                if key not in self.extractors:
+                    self.extractors[key] = DLStreamsExtractor(
+                        request_headers, proxies=proxy_list
+                    )
+                return self.extractors[key]
             elif "lulustream" in url:
                 key = "lulustream"
                 proxy = get_proxy_for_url(
@@ -852,6 +897,17 @@ class HLSProxy:
                 proxy_list = [proxy] if proxy else []
                 if key not in self.extractors:
                     self.extractors[key] = SupervideoExtractor(
+                        request_headers, proxies=proxy_list
+                    )
+                return self.extractors[key]
+            elif "dropload" in url:
+                key = "dropload"
+                proxy = get_proxy_for_url(
+                    "dropload", TRANSPORT_ROUTES, GLOBAL_PROXIES
+                )
+                proxy_list = [proxy] if proxy else []
+                if key not in self.extractors:
+                    self.extractors[key] = DroploadExtractor(
                         request_headers, proxies=proxy_list
                     )
                 return self.extractors[key]
@@ -961,17 +1017,49 @@ class HLSProxy:
             for param_name, param_value in request.query.items():
                 if param_name.startswith("h_"):
                     header_name = param_name[2:]
+                    
+                    # ✅ FIX: Rimuovi eventuali header duplicati (case-insensitive)
+                    # Es. se arriva h_Referer, rimuovi sia 'Referer' che 'referer' già presenti
+                    keys_to_remove = [k for k in combined_headers.keys() if k.lower() == header_name.lower()]
+                    for k in keys_to_remove:
+                        del combined_headers[k]
+                    
                     combined_headers[header_name] = param_value
 
             # DEBUG LOGGING
             print(f"🔍 [DEBUG] Processing URL: {target_url}")
             print(f"   Headers: {dict(request.headers)}")
 
-            extractor = await self.get_extractor(target_url, combined_headers)
+            captured_manifest = None
+            is_rewritten_hls_segment = request.path.startswith("/proxy/hls/segment.")
+            if is_rewritten_hls_segment:
+                extractor = None
+                stream_url = target_url
+                stream_headers = {}
+                for header_name, header_value in combined_headers.items():
+                    if header_name.lower() in {
+                        "host",
+                        "connection",
+                        "cache-control",
+                        "icy-metadata",
+                        "accept-encoding",
+                        "content-length",
+                    }:
+                        continue
+                    stream_headers[header_name] = header_value
+                print("   Extractor: direct-segment-proxy")
+            else:
+                extractor = await self.get_extractor(target_url, combined_headers)
+                
+                # ✅ FIX CRITICO: Forza l'aggiornamento degli header dell'estrattore.
+                # Siccome gli estrattori vengono memorizzati in self.extractors (cache),
+                # se non aggiorniamo request_headers, i segmenti successivi userebbero 
+                # gli header del primo manifest caricato, ignorando h_Referer/h_Origin.
+                if extractor:
+                    extractor.request_headers = combined_headers
 
-            print(f"   Extractor: {type(extractor).__name__}")
+                print(f"   Extractor: {type(extractor).__name__}")
 
-            try:
                 # Passa il flag force_refresh all'estrattore
                 result = await extractor.extract(
                     target_url,
@@ -980,330 +1068,356 @@ class HLSProxy:
                 )
                 stream_url = result["destination_url"]
                 stream_headers = result.get("request_headers", {})
+                captured_manifest = result.get("captured_manifest")
 
-                print(f"   Resolved Stream URL: {stream_url}")
-                print(f"   Stream Headers: {stream_headers}")
+            print(f"   Resolved Stream URL: {stream_url}")
+            print(f"   Stream Headers: {stream_headers}")
 
-                # Se redirect_stream è False, restituisci il JSON con i dettagli (stile MediaFlow)
-                if not redirect_stream:
-                    # Costruisci l'URL base del proxy
-                    scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
-                    host = request.headers.get("X-Forwarded-Host", request.host)
-                    proxy_base = f"{scheme}://{host}"
+            # Se redirect_stream è False, restituisci il JSON con i dettagli (stile MediaFlow)
+            if not redirect_stream:
+                # Costruisci l'URL base del proxy
+                scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
+                host = request.headers.get("X-Forwarded-Host", request.host)
+                proxy_base = f"{scheme}://{host}"
 
-                    mediaflow_endpoint = result.get("mediaflow_endpoint", "hls_proxy")
+                mediaflow_endpoint = (
+                    result.get("mediaflow_endpoint", "hls_proxy")
+                    if not is_rewritten_hls_segment
+                    else "hls_proxy"
+                )
 
-                    # Determina l'endpoint corretto (Logic aggiornata come nell'extractor)
-                    endpoint = "/proxy/hls/manifest.m3u8"
-                    if (
-                        mediaflow_endpoint == "proxy_stream_endpoint"
-                        or ".mp4" in stream_url
-                        or ".mkv" in stream_url
-                        or ".avi" in stream_url
-                    ):
-                        endpoint = "/proxy/stream"
-                    elif ".mpd" in stream_url:
-                        endpoint = "/proxy/mpd/manifest.m3u8"
+                # Determina l'endpoint corretto (Logic aggiornata come nell'extractor)
+                endpoint = "/proxy/hls/manifest.m3u8"
+                if (
+                    mediaflow_endpoint == "proxy_stream_endpoint"
+                    or ".mp4" in stream_url
+                    or ".mkv" in stream_url
+                    or ".avi" in stream_url
+                ):
+                    endpoint = "/proxy/stream"
+                elif ".mpd" in stream_url:
+                    endpoint = "/proxy/mpd/manifest.m3u8"
 
-                    # Prepariamo i parametri per il JSON
-                    q_params = {}
-                    api_password = request.query.get("api_password")
-                    if api_password:
-                        q_params["api_password"] = api_password
+                # Prepariamo i parametri per il JSON
+                q_params = {}
+                api_password = request.query.get("api_password")
+                if api_password:
+                    q_params["api_password"] = api_password
 
-                    response_data = {
-                        "destination_url": stream_url,
-                        "request_headers": stream_headers,
-                        "mediaflow_endpoint": mediaflow_endpoint,
-                        "mediaflow_proxy_url": f"{proxy_base}{endpoint}",  # URL Pulito
-                        "query_params": q_params,
-                    }
-                    return web.json_response(response_data)
+                response_data = {
+                    "destination_url": stream_url,
+                    "request_headers": stream_headers,
+                    "mediaflow_endpoint": mediaflow_endpoint,
+                    "mediaflow_proxy_url": f"{proxy_base}{endpoint}",  # URL Pulito
+                    "query_params": q_params,
+                }
+                return web.json_response(response_data)
 
-                # Aggiungi headers personalizzati da query params
-                h_params_found = []
-                for param_name, param_value in request.query.items():
-                    if param_name.startswith("h_"):
-                        header_name = param_name[2:]
-                        h_params_found.append(header_name)
+            if captured_manifest and request.path.endswith("manifest.m3u8"):
+                scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
+                host = request.headers.get("X-Forwarded-Host", request.host)
+                proxy_base = f"{scheme}://{host}"
+                original_channel_url = request.query.get("url", "")
+                api_password = request.query.get("api_password")
+                no_bypass = request.query.get("no_bypass") == "1"
+                rewritten_manifest = await ManifestRewriter.rewrite_manifest_urls(
+                    captured_manifest,
+                    stream_url,
+                    proxy_base,
+                    stream_headers,
+                    original_channel_url,
+                    api_password,
+                    self.get_extractor,
+                    no_bypass,
+                )
+                return web.Response(
+                    text=rewritten_manifest,
+                    headers={
+                        "Content-Type": "application/vnd.apple.mpegurl",
+                        "Content-Disposition": 'attachment; filename="stream.m3u8"',
+                        "Access-Control-Allow-Origin": "*",
+                        "Cache-Control": "no-cache",
+                    },
+                )
 
-                        # ✅ FIX: Rimuovi eventuali header duplicati (case-insensitive) presenti in stream_headers
-                        # Questo assicura che l'header passato via query param (es. h_Referer) abbia la priorità
-                        # e non vada in conflitto con quelli generati dagli estrattori (es. referer minuscolo).
-                        keys_to_remove = [
-                            k
-                            for k in stream_headers.keys()
-                            if k.lower() == header_name.lower()
-                        ]
-                        for k in keys_to_remove:
-                            del stream_headers[k]
+            # Aggiungi headers personalizzati da query params
+            h_params_found = []
+            for param_name, param_value in request.query.items():
+                if param_name.startswith("h_"):
+                    header_name = param_name[2:]
+                    h_params_found.append(header_name)
 
-                        stream_headers[header_name] = param_value
+                    # ✅ FIX: Rimuovi eventuali header duplicati (case-insensitive) presenti in stream_headers
+                    # Questo assicura che l'header passato via query param (es. h_Referer) abbia la priorità
+                    # e non vada in conflitto con quelli generati dagli estrattori (es. referer minuscolo).
+                    keys_to_remove = [
+                        k
+                        for k in stream_headers.keys()
+                        if k.lower() == header_name.lower()
+                    ]
+                    for k in keys_to_remove:
+                        del stream_headers[k]
 
-                if h_params_found:
-                    logger.debug(
-                        f"   Headers overridden by query params: {h_params_found}"
+                    stream_headers[header_name] = param_value
+
+            if h_params_found:
+                logger.debug(
+                    f"   Headers overridden by query params: {h_params_found}"
+                )
+            else:
+                logger.debug("   No h_ params found in query string.")
+
+
+            # Stream URL resolved
+            # ✅ MPD/DASH handling based on MPD_MODE
+            # ✅ FIX: Refined MPD/DASH detection. Use specific patterns to avoid false positives 
+            # (e.g. "dashinripe" in URL being mistaken for a DASH manifest).
+            is_mpd = ".mpd" in stream_url.lower() or "/dash/" in stream_url.lower()
+            if is_mpd:
+                if MPD_MODE == "ffmpeg" and self.ffmpeg_manager:
+                    # FFmpeg transcoding mode
+                    logger.info(
+                        f"🔄 [FFmpeg Mode] Routing MPD stream: {stream_url}"
                     )
-                else:
-                    logger.debug("   No h_ params found in query string.")
 
+                    # Extract ClearKey if present
+                    clearkey_param = request.query.get("clearkey")
 
-                # Stream URL resolved
-                # ✅ MPD/DASH handling based on MPD_MODE
-                if ".mpd" in stream_url or "dash" in stream_url.lower():
-                    if MPD_MODE == "ffmpeg" and self.ffmpeg_manager:
-                        # FFmpeg transcoding mode
-                        logger.info(
-                            f"🔄 [FFmpeg Mode] Routing MPD stream: {stream_url}"
-                        )
+                    # Support separate key_id and key params (handling multiple keys)
+                    if not clearkey_param:
+                        key_id_param = request.query.get("key_id")
+                        key_val_param = request.query.get("key")
 
-                        # Extract ClearKey if present
-                        clearkey_param = request.query.get("clearkey")
+                        if key_id_param and key_val_param:
+                            # Check for multiple keys
+                            key_ids = key_id_param.split(",")
+                            key_vals = key_val_param.split(",")
 
-                        # Support separate key_id and key params (handling multiple keys)
-                        if not clearkey_param:
-                            key_id_param = request.query.get("key_id")
-                            key_val_param = request.query.get("key")
-
-                            if key_id_param and key_val_param:
-                                # Check for multiple keys
-                                key_ids = key_id_param.split(",")
-                                key_vals = key_val_param.split(",")
-
-                                if len(key_ids) == len(key_vals):
+                            if len(key_ids) == len(key_vals):
+                                clearkey_parts = []
+                                for kid, kval in zip(key_ids, key_vals):
+                                    clearkey_parts.append(
+                                        f"{kid.strip()}:{kval.strip()}"
+                                    )
+                                clearkey_param = ",".join(clearkey_parts)
+                            else:
+                                # Fallback or error? defaulting to first or simple concat if mismatch
+                                # Let's try to handle single mismatch case gracefully or just use as is
+                                if len(key_ids) == 1 and len(key_vals) == 1:
+                                    clearkey_param = (
+                                        f"{key_id_param}:{key_val_param}"
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"Mismatch in key_id/key count: {len(key_ids)} vs {len(key_vals)}"
+                                    )
+                                    # Try to pair as many as possible
+                                    min_len = min(len(key_ids), len(key_vals))
                                     clearkey_parts = []
-                                    for kid, kval in zip(key_ids, key_vals):
+                                    for i in range(min_len):
                                         clearkey_parts.append(
-                                            f"{kid.strip()}:{kval.strip()}"
+                                            f"{key_ids[i].strip()}:{key_vals[i].strip()}"
                                         )
                                     clearkey_param = ",".join(clearkey_parts)
-                                else:
-                                    # Fallback or error? defaulting to first or simple concat if mismatch
-                                    # Let's try to handle single mismatch case gracefully or just use as is
-                                    if len(key_ids) == 1 and len(key_vals) == 1:
-                                        clearkey_param = (
-                                            f"{key_id_param}:{key_val_param}"
-                                        )
-                                    else:
-                                        logger.warning(
-                                            f"Mismatch in key_id/key count: {len(key_ids)} vs {len(key_vals)}"
-                                        )
-                                        # Try to pair as many as possible
-                                        min_len = min(len(key_ids), len(key_vals))
-                                        clearkey_parts = []
-                                        for i in range(min_len):
-                                            clearkey_parts.append(
-                                                f"{key_ids[i].strip()}:{key_vals[i].strip()}"
-                                            )
-                                        clearkey_param = ",".join(clearkey_parts)
 
-                            elif key_val_param:
-                                clearkey_param = key_val_param
+                        elif key_val_param:
+                            clearkey_param = key_val_param
 
-                        playlist_rel_path = await self.ffmpeg_manager.get_stream(
-                            stream_url, stream_headers, clearkey=clearkey_param
-                        )
+                    playlist_rel_path = await self.ffmpeg_manager.get_stream(
+                        stream_url, stream_headers, clearkey=clearkey_param
+                    )
 
-                        if playlist_rel_path:
-                            # Construct local URL for the FFmpeg stream
-                            scheme = request.headers.get(
-                                "X-Forwarded-Proto", request.scheme
-                            )
-                            host = request.headers.get("X-Forwarded-Host", request.host)
-                            local_url = (
-                                f"{scheme}://{host}/ffmpeg_stream/{playlist_rel_path}"
-                            )
-
-                            # Generate Master Playlist for compatibility
-                            master_playlist = (
-                                "#EXTM3U\n"
-                                "#EXT-X-VERSION:3\n"
-                                '#EXT-X-STREAM-INF:BANDWIDTH=6000000,NAME="Live"\n'
-                                f"{local_url}\n"
-                            )
-
-                            return web.Response(
-                                text=master_playlist,
-                                content_type="application/vnd.apple.mpegurl",
-                                headers={
-                                    "Access-Control-Allow-Origin": "*",
-                                    "Cache-Control": "no-cache",
-                                },
-                            )
-                        else:
-                            logger.error("❌ FFmpeg failed to start")
-                            return web.Response(
-                                text="FFmpeg failed to process stream", status=502
-                            )
-                    else:
-                        # Legacy mode: use mpd_converter for HLS conversion with server-side decryption
-                        logger.info(
-                            f"🔄 [Legacy Mode] Converting MPD to HLS: {stream_url}"
-                        )
-
-                        if MPDToHLSConverter is None:
-                            logger.error(
-                                "❌ MPDToHLSConverter not available in legacy mode"
-                            )
-                            return web.Response(
-                                text="Legacy MPD converter not available", status=503
-                            )
-
-                        # Fetch the MPD manifest with proxy support
-                        ssl_context = None
-                        disable_ssl = get_ssl_setting_for_url(
-                            stream_url, TRANSPORT_ROUTES
-                        )
-                        if disable_ssl:
-                            ssl_context = False
-
-                        # Use helper to get proxy-enabled session
-                        mpd_session, mpd_proxy = await self._get_proxy_session(
-                            stream_url
-                        )
-                        if mpd_proxy:
-                            logger.info(
-                                f"📡 [MPD] Using session via proxy: {mpd_proxy}"
-                            )
-                        final_mpd_url = stream_url  # Will be updated if redirected
-
-                        try:
-                            async with mpd_session.get(
-                                stream_url,
-                                headers=stream_headers,
-                                ssl=ssl_context,
-                                allow_redirects=True,
-                            ) as resp:
-                                # Capture final URL after redirects (use for segment URL construction)
-                                final_mpd_url = str(resp.url)
-                                if final_mpd_url != stream_url:
-                                    logger.info(f"↪️ MPD redirected to: {final_mpd_url}")
-
-                                if resp.status != 200:
-                                    error_text = await resp.text()
-                                    logger.error(
-                                        f"❌ Failed to fetch MPD. Status: {resp.status}, URL: {stream_url}"
-                                    )
-                                    logger.error(f"   Headers: {stream_headers}")
-                                    logger.error(
-                                        f"   Response: {error_text[:500]}"
-                                    )  # Truncate for safety
-                                    return web.Response(
-                                        text=f"Failed to fetch MPD: {resp.status}\nResponse: {error_text[:1000]}",
-                                        status=502,
-                                    )
-                                manifest_content = await resp.text()
-                        finally:
-                            # Session is pooled/cached, so we don't close it
-                            pass
-
-                        # Build proxy base URL
+                    if playlist_rel_path:
+                        # Construct local URL for the FFmpeg stream
                         scheme = request.headers.get(
                             "X-Forwarded-Proto", request.scheme
                         )
                         host = request.headers.get("X-Forwarded-Host", request.host)
-                        proxy_base = f"{scheme}://{host}"
-
-                        # Build params string with headers
-                        params = "".join(
-                            [
-                                f"&h_{urllib.parse.quote(key)}={urllib.parse.quote(value)}"
-                                for key, value in stream_headers.items()
-                            ]
+                        local_url = (
+                            f"{scheme}://{host}/ffmpeg_stream/{playlist_rel_path}"
                         )
 
-                        # Add api_password if present
-                        api_password = request.query.get("api_password")
-                        if api_password:
-                            params += f"&api_password={api_password}"
-
-                        # Get ClearKey param
-                        clearkey_param = request.query.get("clearkey")
-                        if not clearkey_param:
-                            key_id_param = request.query.get("key_id")
-                            key_val_param = request.query.get("key")
-
-                            if key_id_param and key_val_param:
-                                # Check for multiple keys
-                                key_ids = key_id_param.split(",")
-                                key_vals = key_val_param.split(",")
-
-                                if len(key_ids) == len(key_vals):
-                                    clearkey_parts = []
-                                    for kid, kval in zip(key_ids, key_vals):
-                                        clearkey_parts.append(
-                                            f"{kid.strip()}:{kval.strip()}"
-                                        )
-                                    clearkey_param = ",".join(clearkey_parts)
-                                else:
-                                    if len(key_ids) == 1 and len(key_vals) == 1:
-                                        clearkey_param = (
-                                            f"{key_id_param}:{key_val_param}"
-                                        )
-                                    else:
-                                        logger.warning(
-                                            f"Mismatch in key_id/key count: {len(key_ids)} vs {len(key_vals)}"
-                                        )
-                                        # Try to pair as many as possible
-                                        min_len = min(len(key_ids), len(key_vals))
-                                        clearkey_parts = []
-                                        for i in range(min_len):
-                                            clearkey_parts.append(
-                                                f"{key_ids[i].strip()}:{key_vals[i].strip()}"
-                                            )
-                                        clearkey_param = ",".join(clearkey_parts)
-                            elif key_val_param:
-                                clearkey_param = key_val_param
-
-                        if clearkey_param:
-                            params += f"&clearkey={clearkey_param}"
-
-                        # Pass 'ext' param if present (e.g. ext=ts)
-                        ext_param = request.query.get("ext")
-                        if ext_param:
-                            params += f"&ext={ext_param}"
-
-                        # Check if requesting specific representation
-                        rep_id = request.query.get("rep_id")
-
-                        converter = MPDToHLSConverter()
-                        if rep_id:
-                            # Generate media playlist for specific representation
-                            # Use final_mpd_url (after redirects) for segment URL construction
-                            hls_content = converter.convert_media_playlist(
-                                manifest_content,
-                                rep_id,
-                                proxy_base,
-                                final_mpd_url,
-                                params,
-                                clearkey_param,
-                            )
-                        else:
-                            # Generate master playlist
-                            # Use final_mpd_url (after redirects) for segment URL construction
-                            hls_content = converter.convert_master_playlist(
-                                manifest_content, proxy_base, final_mpd_url, params
-                            )
+                        # Generate Master Playlist for compatibility
+                        master_playlist = (
+                            "#EXTM3U\n"
+                            "#EXT-X-VERSION:3\n"
+                            '#EXT-X-STREAM-INF:BANDWIDTH=6000000,NAME="Live"\n'
+                            f"{local_url}\n"
+                        )
 
                         return web.Response(
-                            text=hls_content,
+                            text=master_playlist,
                             content_type="application/vnd.apple.mpegurl",
                             headers={
                                 "Access-Control-Allow-Origin": "*",
                                 "Cache-Control": "no-cache",
                             },
                         )
+                    else:
+                        logger.error("❌ FFmpeg failed to start")
+                        return web.Response(
+                            text="FFmpeg failed to process stream", status=502
+                        )
+                else:
+                    # Legacy mode: use mpd_converter for HLS conversion with server-side decryption
+                    logger.info(
+                        f"🔄 [Legacy Mode] Converting MPD to HLS: {stream_url}"
+                    )
 
-                return await self._proxy_stream(request, stream_url, stream_headers)
-            except ExtractorError as e:
-                logger.warning(f"Extraction failed, retrying with forced refresh: {e}")
-                result = await extractor.extract(
-                    target_url, force_refresh=True
-                )  # Forza sempre il refresh al secondo tentativo
-                stream_url = result["destination_url"]
-                stream_headers = result.get("request_headers", {})
-                # Stream URL resolved after refresh
-                return await self._proxy_stream(request, stream_url, stream_headers)
+                    if MPDToHLSConverter is None:
+                        logger.error(
+                            "❌ MPDToHLSConverter not available in legacy mode"
+                        )
+                        return web.Response(
+                            text="Legacy MPD converter not available", status=503
+                        )
+
+                    # Fetch the MPD manifest with proxy support
+                    ssl_context = None
+                    disable_ssl = get_ssl_setting_for_url(
+                        stream_url, TRANSPORT_ROUTES
+                    )
+                    if disable_ssl:
+                        ssl_context = False
+
+                    # Use helper to get proxy-enabled session
+                    mpd_session, mpd_proxy = await self._get_proxy_session(
+                        stream_url
+                    )
+                    if mpd_proxy:
+                        logger.info(
+                            f"📡 [MPD] Using session via proxy: {mpd_proxy}"
+                        )
+                    final_mpd_url = stream_url  # Will be updated if redirected
+
+                    try:
+                        async with mpd_session.get(
+                            stream_url,
+                            headers=stream_headers,
+                            ssl=ssl_context,
+                            allow_redirects=True,
+                        ) as resp:
+                            # Capture final URL after redirects (use for segment URL construction)
+                            final_mpd_url = str(resp.url)
+                            if final_mpd_url != stream_url:
+                                logger.info(f"↪️ MPD redirected to: {final_mpd_url}")
+
+                            if resp.status != 200:
+                                error_text = await resp.text()
+                                logger.error(
+                                    f"❌ Failed to fetch MPD. Status: {resp.status}, URL: {stream_url}"
+                                )
+                                logger.error(f"   Headers: {stream_headers}")
+                                logger.error(
+                                    f"   Response: {error_text[:500]}"
+                                )  # Truncate for safety
+                                return web.Response(
+                                    text=f"Failed to fetch MPD: {resp.status}\nResponse: {error_text[:1000]}",
+                                    status=502,
+                                )
+                            manifest_content = await resp.text()
+                    finally:
+                        # Session is pooled/cached, so we don't close it
+                        pass
+
+                    # Build proxy base URL
+                    scheme = request.headers.get(
+                        "X-Forwarded-Proto", request.scheme
+                    )
+                    host = request.headers.get("X-Forwarded-Host", request.host)
+                    proxy_base = f"{scheme}://{host}"
+
+                    # Build params string with headers
+                    params = "".join(
+                        [
+                            f"&h_{urllib.parse.quote(key)}={urllib.parse.quote(value)}"
+                            for key, value in stream_headers.items()
+                        ]
+                    )
+
+                    # Add api_password if present
+                    api_password = request.query.get("api_password")
+                    if api_password:
+                        params += f"&api_password={api_password}"
+
+                    # Get ClearKey param
+                    clearkey_param = request.query.get("clearkey")
+                    if not clearkey_param:
+                        key_id_param = request.query.get("key_id")
+                        key_val_param = request.query.get("key")
+
+                        if key_id_param and key_val_param:
+                            # Check for multiple keys
+                            key_ids = key_id_param.split(",")
+                            key_vals = key_val_param.split(",")
+
+                            if len(key_ids) == len(key_vals):
+                                clearkey_parts = []
+                                for kid, kval in zip(key_ids, key_vals):
+                                    clearkey_parts.append(
+                                        f"{kid.strip()}:{kval.strip()}"
+                                    )
+                                clearkey_param = ",".join(clearkey_parts)
+                            else:
+                                if len(key_ids) == 1 and len(key_vals) == 1:
+                                    clearkey_param = (
+                                        f"{key_id_param}:{key_val_param}"
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"Mismatch in key_id/key count: {len(key_ids)} vs {len(key_vals)}"
+                                    )
+                                    # Try to pair as many as possible
+                                    min_len = min(len(key_ids), len(key_vals))
+                                    clearkey_parts = []
+                                    for i in range(min_len):
+                                        clearkey_parts.append(
+                                            f"{key_ids[i].strip()}:{key_vals[i].strip()}"
+                                        )
+                                    clearkey_param = ",".join(clearkey_parts)
+                        elif key_val_param:
+                            clearkey_param = key_val_param
+
+                    if clearkey_param:
+                        params += f"&clearkey={clearkey_param}"
+
+                    # Pass 'ext' param if present (e.g. ext=ts)
+                    ext_param = request.query.get("ext")
+                    if ext_param:
+                        params += f"&ext={ext_param}"
+
+                    # Check if requesting specific representation
+                    rep_id = request.query.get("rep_id")
+
+                    converter = MPDToHLSConverter()
+                    if rep_id:
+                        # Generate media playlist for specific representation
+                        # Use final_mpd_url (after redirects) for segment URL construction
+                        hls_content = converter.convert_media_playlist(
+                            manifest_content,
+                            rep_id,
+                            proxy_base,
+                            final_mpd_url,
+                            params,
+                            clearkey_param,
+                        )
+                    else:
+                        # Generate master playlist
+                        # Use final_mpd_url (after redirects) for segment URL construction
+                        hls_content = converter.convert_master_playlist(
+                            manifest_content, proxy_base, final_mpd_url, params
+                        )
+
+                    return web.Response(
+                        text=hls_content,
+                        content_type="application/vnd.apple.mpegurl",
+                        headers={
+                            "Access-Control-Allow-Origin": "*",
+                            "Cache-Control": "no-cache",
+                        },
+                    )
+
+            return await self._proxy_stream(request, stream_url, stream_headers)
 
         except Exception as e:
             # ✅ MIGLIORATO: Distingui tra errori temporanei (sito offline) ed errori critici
@@ -1370,6 +1484,7 @@ class HLSProxy:
                     "available_hosts": [
                         "vavoo",
                         "vixsrc",
+                        "vixcloud",
                         "sportsonline",
                         "mixdrop",
                         "voe",
@@ -1386,6 +1501,7 @@ class HLSProxy:
                         "okru",
                         "streamwish",
                         "supervideo",
+                        "dropload",
                         "uqload",
                         "vidmoly",
                         "vidoza",
@@ -1654,6 +1770,32 @@ class HLSProxy:
             # aiohttp already decodes query parameters once.
             # Avoid unquoting again or embedded encoded URLs may break.
 
+            original_channel_url = request.query.get("original_channel_url")
+            if original_channel_url and any(
+                marker in original_channel_url for marker in ["dlhd.dad", "dlstreams.top"]
+            ):
+                try:
+                    extractor = await self.get_extractor(original_channel_url, {})
+                    if hasattr(extractor, "fetch_key_via_browser"):
+                        browser_key = await extractor.fetch_key_via_browser(
+                            key_url, original_channel_url
+                        )
+                        if browser_key:
+                            logger.info("✅ AES key fetched via browser context")
+                            return web.Response(
+                                body=browser_key,
+                                content_type="application/octet-stream",
+                                headers={
+                                    "Access-Control-Allow-Origin": "*",
+                                    "Access-Control-Allow-Headers": "*",
+                                    "Cache-Control": "no-cache, no-store, must-revalidate",
+                                },
+                            )
+                except Exception as browser_key_exc:
+                    logger.warning(
+                        f"⚠️ Browser-backed key fetch failed, falling back to direct request: {browser_key_exc}"
+                    )
+
             # Inizializza gli header esclusivamente da quelli passati dinamicamente
             headers = {}
             for param_name, param_value in request.query.items():
@@ -1662,6 +1804,8 @@ class HLSProxy:
                     # ✅ FIX: Rimuovi header Range per le richieste di chiavi.
                     if header_name.lower() == "range":
                         continue
+                    if header_name.lower() in {"x-direct-connection", "x-force-direct"}:
+                        continue
                     headers[header_name] = param_value
 
             logger.info(f"🔑 Fetching AES key from: {key_url}")
@@ -1669,9 +1813,14 @@ class HLSProxy:
 
             # ✅ Use pooled session for better performance
             # The session already has the proxy configured in its connector
-            session, proxy_used = await self._get_proxy_session(key_url)
-            if proxy_used:
-                logger.info(f"Using pooled session with proxy: {proxy_used}")
+            if self._should_force_direct_from_query(request):
+                session = await self._get_session()
+                proxy_used = None
+                logger.info("Using direct session for AES key request (forced)")
+            else:
+                session, proxy_used = await self._get_proxy_session(key_url)
+                if proxy_used:
+                    logger.info(f"Using pooled session with proxy: {proxy_used}")
             secret_key = headers.pop("X-Secret-Key", None)
 
             # Calcola X-Key-Timestamp, X-Key-Nonce, X-Fingerprint, e X-Key-Path se abbiamo la secret_key
@@ -1897,6 +2046,10 @@ class HLSProxy:
                 elif key.lower() == "cookie":
                     headers["Cookie"] = headers.pop(key)
 
+            for internal_header in ["X-Direct-Connection", "x-direct-connection", "X-Force-Direct", "x-force-direct"]:
+                if internal_header in headers:
+                    del headers[internal_header]
+
             # ✅ FIX: Rimuovi duplicati espliciti se presenti (es. user-agent e User-Agent)
             # Questo può accadere se GenericHLSExtractor aggiunge 'user-agent' e noi abbiamo 'User-Agent' da h_ params
             # La normalizzazione sopra dovrebbe averli unificati, ma per sicurezza puliamo.
@@ -1908,10 +2061,17 @@ class HLSProxy:
             disable_ssl = get_ssl_setting_for_url(stream_url, TRANSPORT_ROUTES)
 
             # ✅ Use pooled session for better performance
-            session, session_proxy = await self._get_proxy_session(stream_url)
-            logger.info(
-                f"📡 [Proxy Stream] Using session{f' via proxy {session_proxy}' if session_proxy else ' (direct)'} for: {stream_url}"
-            )
+            if self._should_force_direct_from_query(request):
+                session = await self._get_session()
+                session_proxy = None
+                logger.info(
+                    f"[Proxy Stream] Using direct session (forced) for: {stream_url}"
+                )
+            else:
+                session, session_proxy = await self._get_proxy_session(stream_url)
+                logger.info(
+                    f"📡 [Proxy Stream] Using session{f' via proxy {session_proxy}' if session_proxy else ' (direct)'} for: {stream_url}"
+                )
             async with session.get(
                 stream_url, headers=headers, ssl=not disable_ssl
             ) as resp:
@@ -1940,41 +2100,105 @@ class HLSProxy:
                     )
 
                 # Gestione special per manifest HLS
-                # ✅ Gestisce manifest HLS standard
-                is_hls_manifest = "mpegurl" in content_type or stream_url.endswith(
-                    ".m3u8"
+                # ✅ AGGIORNATO: Prima leggi il body, poi decidi se è un manifest
+                # DLStreams invia i manifest come 'text/txt' o 'text/css', quindi
+                # non possiamo fidarci del Content-Type. Usiamo il signature '#EXTM3U'.
+
+                is_direct_media_stream = request.path == "/proxy/stream" and (
+                    "video/" in content_type.lower()
+                    or stream_url.lower().endswith((".mp4", ".mkv", ".avi", ".mov"))
                 )
+                if is_direct_media_stream:
+                    response_headers = {}
+                    for header in [
+                        "content-type",
+                        "content-length",
+                        "content-range",
+                        "accept-ranges",
+                        "last-modified",
+                        "etag",
+                    ]:
+                        if header in resp.headers:
+                            response_headers[header] = resp.headers[header]
 
-                if is_hls_manifest:
-                    try:
-                        # Leggi come bytes prima per evitare crash su decode
-                        content_bytes = await resp.read()
+                    set_response_header(
+                        response_headers, "Access-Control-Allow-Origin", "*"
+                    )
+                    set_response_header(
+                        response_headers,
+                        "Access-Control-Allow-Methods",
+                        "GET, HEAD, OPTIONS",
+                    )
+                    set_response_header(
+                        response_headers,
+                        "Access-Control-Allow-Headers",
+                        "Range, Content-Type",
+                    )
 
+                    response = web.StreamResponse(
+                        status=resp.status, headers=response_headers
+                    )
+                    await response.prepare(request)
+
+                    async for chunk in resp.content.iter_chunked(8192):
+                        await response.write(chunk)
+                    await response.write_eof()
+                    return response
+                
+                content_bytes = await resp.read()
+                
+                # Prova a decodificare come testo per controllare la firma
+                manifest_content = None
+                try:
+                    decoded_text = content_bytes.decode("utf-8")
+                    # Controllo firma HLS: è un manifest se inizia con #EXTM3U
+                    if decoded_text.lstrip().startswith("#EXTM3U"):
+                        manifest_content = decoded_text
+                except UnicodeDecodeError:
+                    pass  # È binario, non è un manifest
+                
+                # Fallback: controlla anche il content-type standard per m3u8
+                if manifest_content is None:
+                    is_hls_manifest_by_type = "mpegurl" in content_type or stream_url.endswith(".m3u8")
+                    if is_hls_manifest_by_type:
                         try:
-                            # Tenta la decodifica testo
                             manifest_content = content_bytes.decode("utf-8")
                         except UnicodeDecodeError:
-                            # SE FALLISCE: È binario mascherato (es. segmento .ts in un .css)
-                            logger.warning(
-                                f"⚠️ Binary detected in {stream_url} (masked as {content_type}). Serving as binary."
-                            )
+                            logger.warning(f"⚠️ Binary detected in {stream_url} (masked as {content_type}). Serving as binary.")
                             return web.Response(
                                 body=content_bytes,
                                 status=resp.status,
                                 headers={
-                                    "Content-Type": "video/MP2T",  # Forza TS se è binario camuffato
+                                    "Content-Type": "video/MP2T",
                                     "Access-Control-Allow-Origin": "*",
                                 },
                             )
 
-                    except Exception as e:
-                        logger.error(f"Error processing manifest: {e}")
-                        # Fallback to binary proxy
-                        return web.Response(
-                            body=await resp.read(),
-                            status=resp.status,
-                            headers={"Access-Control-Allow-Origin": "*"},
-                        )
+                if manifest_content is None and request.path.startswith("/proxy/hls/segment."):
+                    segment_content_type = "video/mp4"
+                    if request.path.endswith(".ts"):
+                        segment_content_type = "video/MP2T"
+
+                    response_headers = {
+                        "Content-Type": segment_content_type,
+                        "Access-Control-Allow-Origin": "*",
+                    }
+                    if "content-length" in resp.headers:
+                        response_headers["Content-Length"] = resp.headers["content-length"]
+                    if "content-range" in resp.headers:
+                        response_headers["Content-Range"] = resp.headers["content-range"]
+                    if "accept-ranges" in resp.headers:
+                        response_headers["Accept-Ranges"] = resp.headers["accept-ranges"]
+
+                    return web.Response(
+                        body=content_bytes,
+                        status=resp.status,
+                        headers=response_headers,
+                    )
+                
+                if manifest_content is not None:
+                    # È un manifest HLS — riscrivilo
+                    logger.info(f"📄 HLS manifest detected for: {stream_url} (Content-Type: {content_type})")
 
                     # ✅ CORREZIONE: Rileva lo schema e l'host corretti quando dietro un reverse proxy
                     scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
@@ -2008,10 +2232,10 @@ class HLSProxy:
                             "Cache-Control": "no-cache",
                         },
                     )
-
-                # ✅ AGGIORNATO: Gestione per manifest MPD (DASH)
-                elif "dash+xml" in content_type or stream_url.endswith(".mpd"):
-                    manifest_content = await resp.text()
+                
+                # ✅ AGGIORNATO: Gestione per manifest MPD (DASH) - separate block
+                if manifest_content is None and ("dash+xml" in content_type or stream_url.endswith(".mpd")):
+                    manifest_content = content_bytes.decode("utf-8", errors='replace')
 
                     # ✅ CORREZIONE: Rileva lo schema e l'host corretti quando dietro un reverse proxy
                     scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
@@ -2126,7 +2350,8 @@ class HLSProxy:
                         },
                     )
 
-                # Streaming normale per altri tipi di contenuto
+                # Streaming normale per altri tipi di contenuto (segmenti binari)
+                # Il body è già stato letto in content_bytes, usiamo quello.
                 response_headers = {}
 
                 for header in [
@@ -2162,16 +2387,15 @@ class HLSProxy:
                     "Range, Content-Type",
                 )
 
-                response = web.StreamResponse(
-                    status=resp.status, headers=response_headers
+                # Override content-length with actual bytes read
+                response_headers["Content-Length"] = str(len(content_bytes))
+                
+                return web.Response(
+                    body=content_bytes,
+                    status=resp.status,
+                    headers=response_headers,
                 )
 
-                await response.prepare(request)
-
-                async for chunk in resp.content.iter_chunked(8192):
-                    await response.write(chunk)
-                await response.write_eof()
-                return response
 
         except (ClientPayloadError, ConnectionResetError, OSError) as e:
             # Errori tipici di disconnessione del client
@@ -2274,6 +2498,45 @@ class HLSProxy:
                 content_type="text/html",
             )
 
+    async def handle_docs(self, request):
+        """Serve Swagger UI per la documentazione API."""
+        try:
+            html_content = self._read_template("docs.html")
+            return web.Response(text=html_content, content_type="text/html")
+        except Exception as e:
+            logger.error(f"Unable to load 'docs.html': {e}")
+            return web.Response(
+                text="<h1>Error 500</h1><p>Unable to load API docs.</p>",
+                status=500,
+                content_type="text/html",
+            )
+
+    async def handle_redoc(self, request):
+        """Serve ReDoc per la documentazione API."""
+        try:
+            html_content = self._read_template("redoc.html")
+            return web.Response(text=html_content, content_type="text/html")
+        except Exception as e:
+            logger.error(f"Unable to load 'redoc.html': {e}")
+            return web.Response(
+                text="<h1>Error 500</h1><p>Unable to load ReDoc.</p>",
+                status=500,
+                content_type="text/html",
+            )
+
+    async def handle_url_generator(self, request):
+        """Serve la pagina web per generare URL proxy ed extractor."""
+        try:
+            html_content = self._read_template("url_generator.html")
+            return web.Response(text=html_content, content_type="text/html")
+        except Exception as e:
+            logger.error(f"Unable to load 'url_generator.html': {e}")
+            return web.Response(
+                text="<h1>Error 500</h1><p>Unable to load URL generator.</p>",
+                status=500,
+                content_type="text/html",
+            )
+
     async def handle_builder(self, request):
         """Gestisce l'interfaccia web del playlist builder."""
         try:
@@ -2336,7 +2599,6 @@ class HLSProxy:
             "modules": {
                 "playlist_builder": PlaylistBuilder is not None,
                 "vavoo_extractor": VavooExtractor is not None,
-                "dlhd_extractor": DLHDExtractor is not None,
                 "vixsrc_extractor": VixSrcExtractor is not None,
                 "sportsonline_extractor": SportsonlineExtractor is not None,
                 "mixdrop_extractor": MixdropExtractor is not None,
@@ -2372,6 +2634,202 @@ class HLSProxy:
             },
         }
         return web.json_response(info)
+
+    async def handle_openapi(self, request):
+        """Espone una specifica OpenAPI minimale per Swagger/ReDoc."""
+        server_url = f"{request.scheme}://{request.host}"
+        requires_password = bool(API_PASSWORD)
+
+        security_schemes = {
+            "ApiPasswordQuery": {
+                "type": "apiKey",
+                "in": "query",
+                "name": "api_password",
+                "description": "Primary auth method shown in docs. Header x-api-password is still accepted by the server.",
+            },
+        }
+        security = [{"ApiPasswordQuery": []}] if requires_password else []
+
+        spec = {
+            "openapi": "3.0.3",
+            "info": {
+                "title": "EasyProxy API",
+                "version": "2.5.0",
+                "description": (
+                    "Interactive documentation for EasyProxy. "
+                    "Includes HLS/MPD proxying, extractor endpoints, key and license helpers, "
+                    "playlist generation, and compatibility endpoints inspired by MediaFlow Proxy."
+                ),
+            },
+            "servers": [{"url": server_url}],
+            "components": {"securitySchemes": security_schemes},
+            "paths": {
+                "/api/info": {
+                    "get": {
+                        "summary": "Server information",
+                        "description": "Returns server status, loaded extractors, modules, and example endpoints.",
+                        "responses": {"200": {"description": "Server information JSON"}},
+                    }
+                },
+                "/proxy/manifest.m3u8": {
+                    "get": {
+                        "summary": "Legacy proxy manifest",
+                        "description": "Proxy a manifest using the legacy url parameter.",
+                        "parameters": [
+                            {"name": "url", "in": "query", "schema": {"type": "string"}, "required": True},
+                            {"name": "api_password", "in": "query", "schema": {"type": "string"}},
+                        ],
+                        "responses": {"200": {"description": "Proxied manifest or media response"}},
+                        **({"security": security} if requires_password else {}),
+                    }
+                },
+                "/proxy/hls/manifest.m3u8": {
+                    "get": {
+                        "summary": "Proxy HLS manifest",
+                        "description": "MediaFlow-compatible HLS proxy endpoint.",
+                        "parameters": [
+                            {"name": "d", "in": "query", "schema": {"type": "string"}, "required": True, "description": "Destination manifest URL"},
+                            {"name": "api_password", "in": "query", "schema": {"type": "string"}},
+                        ],
+                        "responses": {"200": {"description": "Proxied HLS manifest"}},
+                        **({"security": security} if requires_password else {}),
+                    }
+                },
+                "/proxy/mpd/manifest.m3u8": {
+                    "get": {
+                        "summary": "Proxy MPD as HLS",
+                        "description": "Converts or relays MPEG-DASH/MPD streams through EasyProxy.",
+                        "parameters": [
+                            {"name": "d", "in": "query", "schema": {"type": "string"}, "required": True, "description": "Destination MPD URL"},
+                            {"name": "key_id", "in": "query", "schema": {"type": "string"}},
+                            {"name": "key", "in": "query", "schema": {"type": "string"}},
+                            {"name": "api_password", "in": "query", "schema": {"type": "string"}},
+                        ],
+                        "responses": {"200": {"description": "Generated HLS manifest"}},
+                        **({"security": security} if requires_password else {}),
+                    }
+                },
+                "/proxy/stream": {
+                    "get": {
+                        "summary": "Generic stream proxy",
+                        "description": "Generic MediaFlow-style stream endpoint for direct proxying.",
+                        "parameters": [
+                            {"name": "d", "in": "query", "schema": {"type": "string"}, "required": True},
+                            {"name": "api_password", "in": "query", "schema": {"type": "string"}},
+                        ],
+                        "responses": {"200": {"description": "Streamed response"}},
+                        **({"security": security} if requires_password else {}),
+                    }
+                },
+                "/extractor": {
+                    "get": {
+                        "summary": "Generic extractor",
+                        "description": "Resolve supported hosters into playable URLs.",
+                        "parameters": [
+                            {"name": "host", "in": "query", "schema": {"type": "string"}},
+                            {"name": "url", "in": "query", "schema": {"type": "string"}},
+                            {"name": "api_password", "in": "query", "schema": {"type": "string"}},
+                        ],
+                        "responses": {"200": {"description": "Extractor response"}},
+                        **({"security": security} if requires_password else {}),
+                    }
+                },
+                "/extractor/video": {
+                    "get": {
+                        "summary": "Extractor compatibility endpoint",
+                        "description": "MediaFlow-compatible alias for video extractor requests.",
+                        "parameters": [
+                            {"name": "host", "in": "query", "schema": {"type": "string"}},
+                            {"name": "url", "in": "query", "schema": {"type": "string"}},
+                            {"name": "api_password", "in": "query", "schema": {"type": "string"}},
+                        ],
+                        "responses": {"200": {"description": "Extractor response"}},
+                        **({"security": security} if requires_password else {}),
+                    }
+                },
+                "/key": {
+                    "get": {
+                        "summary": "Fetch or transform decryption keys",
+                        "description": "Proxy AES-128 keys or derive license-related key material.",
+                        "parameters": [
+                            {"name": "key_url", "in": "query", "schema": {"type": "string"}},
+                            {"name": "key", "in": "query", "schema": {"type": "string"}},
+                            {"name": "key_id", "in": "query", "schema": {"type": "string"}},
+                            {"name": "api_password", "in": "query", "schema": {"type": "string"}},
+                        ],
+                        "responses": {"200": {"description": "Key response"}},
+                        **({"security": security} if requires_password else {}),
+                    }
+                },
+                "/license": {
+                    "get": {
+                        "summary": "License proxy",
+                        "description": "Proxy DRM license requests or handle ClearKey shortcuts.",
+                        "parameters": [
+                            {"name": "url", "in": "query", "schema": {"type": "string"}},
+                            {"name": "clearkey", "in": "query", "schema": {"type": "string"}},
+                            {"name": "api_password", "in": "query", "schema": {"type": "string"}},
+                        ],
+                        "responses": {"200": {"description": "License response"}},
+                        **({"security": security} if requires_password else {}),
+                    },
+                    "post": {
+                        "summary": "License proxy POST",
+                        "description": "POST DRM license payloads to the upstream license server.",
+                        "requestBody": {
+                            "required": False,
+                            "content": {"application/octet-stream": {"schema": {"type": "string", "format": "binary"}}},
+                        },
+                        "responses": {"200": {"description": "License response"}},
+                        **({"security": security} if requires_password else {}),
+                    },
+                },
+                "/generate_urls": {
+                    "post": {
+                        "summary": "Generate proxy URLs",
+                        "description": "Generate one or multiple compatibility URLs for clients.",
+                        "requestBody": {
+                            "required": True,
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "mediaflow_proxy_url": {"type": "string"},
+                                            "api_password": {"type": "string"},
+                                            "urls": {"type": "array", "items": {"type": "object"}},
+                                        },
+                                    }
+                                }
+                            },
+                        },
+                        "responses": {"200": {"description": "Generated URL list"}},
+                        **({"security": security} if requires_password else {}),
+                    }
+                },
+                "/playlist": {
+                    "get": {
+                        "summary": "Build a playlist",
+                        "description": "Combine multiple source URLs into a generated playlist.",
+                        "parameters": [
+                            {"name": "url", "in": "query", "schema": {"type": "string"}, "required": True},
+                            {"name": "api_password", "in": "query", "schema": {"type": "string"}},
+                        ],
+                        "responses": {"200": {"description": "Generated playlist"}},
+                        **({"security": security} if requires_password else {}),
+                    }
+                },
+                "/proxy/ip": {
+                    "get": {
+                        "summary": "Resolve public IP",
+                        "description": "Returns the public IP as seen through the configured proxy route.",
+                        "responses": {"200": {"description": "Public IP response"}},
+                    }
+                },
+            },
+        }
+
+        return web.json_response(spec)
 
     def _prefetch_next_segments(self, current_url, init_url, key, key_id, headers):
         """Identifica i prossimi segmenti e avvia il download in background."""
