@@ -21,7 +21,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     netcat-openbsd \
     ffmpeg \
     chromium \
-    nodejs \
     libnss3 \
     libatk1.0-0 \
     libatk-bridge2.0-0 \
@@ -44,7 +43,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium-driver \
     && rm -rf /var/lib/apt/lists/*
 
-# 3. Environment Settings
+# 2. Environment Settings
 ENV PYTHONPATH=/app
 ENV CHROME_EXE_PATH=/usr/bin/chromium
 ENV CHROME_BIN=/usr/bin/chromium
@@ -66,13 +65,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copia esplicita
 COPY . .
 
-RUN python -m playwright install chromium
 RUN chmod +x entrypoint.sh
 
-# 7. Metadata & Ports
+# 5. Metadata & Ports
 LABEL org.opencontainers.image.title="EasyProxy Monolith"
 LABEL org.opencontainers.image.description="All-in-one HLS Proxy with integrated FlareSolverr v3"
 EXPOSE 7860 8191
 
-# 8. Execution
+# 6. Execution
 ENTRYPOINT ["/bin/bash", "/app/entrypoint.sh"]

@@ -14,6 +14,8 @@ import hashlib
 import hmac
 import json
 import ssl
+import logging
+logger = logging.getLogger(__name__)
 import yarl
 import aiohttp
 from aiohttp import (
@@ -52,6 +54,7 @@ from config import (
     WARP_PROXY_URL,
     BYPASS_WARP_CONTEXT,
     SELECTED_PROXY_CONTEXT,
+    mark_proxy_dead,
 )
 from extractors.generic import GenericHLSExtractor, ExtractorError
 from services.manifest_rewriter import ManifestRewriter
@@ -62,16 +65,18 @@ BYPASSED_WARP_DOMAINS = set()
 # Legacy MPD converter (used when MPD_MODE is not ffmpeg)
 MPDToHLSConverter = None
 decrypt_segment = None
+
+try:
+    from utils.drm_decrypter import decrypt_segment
+except ImportError:
+    pass
+
 if MPD_MODE in ("legacy", "none", "disabled"):
     try:
         from utils.mpd_converter import MPDToHLSConverter
-        from utils.drm_decrypter import decrypt_segment
-
-        logger = logging.getLogger(__name__)
-        logger.info("✅ Legacy MPD modules loaded (mpd_converter, drm_decrypter)")
+        logger.info("✅ Legacy MPD converter loaded")
     except ImportError as e:
-        logger = logging.getLogger(__name__)
-        logger.warning(f"⚠️ MPD_MODE=legacy but modules not found: {e}")
+        logger.warning(f"⚠️ MPD_MODE=legacy but mpd_converter not found: {e}")
 
 # --- Moduli Esterni ---
 (
@@ -364,10 +369,11 @@ class HLSProxy:
 
         # Version information
         self.latest_version = "Checking..."
-        self.warp_status = "Disabled" if not ENABLE_WARP else "Checking..."
-
-        # Version information
-        self.latest_version = "Checking..."
+        
+        # Registry for DASH native sessions (to handle segment proxying without HLS conversion)
+        # session_id -> (base_url, headers, clearkey, timestamp)
+        self.dash_sessions = {}
+        self.dash_session_ttl = 21600  # 6 hours
 
     async def shorten_hls_url(self, url: str) -> str:
         """Crea un ID breve per un URL e lo memorizza nella mappa."""
@@ -964,6 +970,15 @@ class HLSProxy:
                     return self.extractors[key]
 
             # 2. Auto-detection basata sull'URL
+            # ✅ NUOVO: Salta estrattori specifici se l'URL sembra già un link diretto a un media
+            # (evita di provare a estrarre un .mp4 come se fosse una pagina HTML)
+            path_lower = url.split('?')[0].lower()
+            if any(path_lower.endswith(ext) for ext in [".mp4", ".m3u8", ".ts", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".mp3", ".aac", ".m4a", ".mpd"]):
+                key = "hls_generic"
+                if key not in self.extractors:
+                    self.extractors[key] = GenericHLSExtractor(request_headers, proxies=GLOBAL_PROXIES)
+                return self.extractors[key]
+
             if "vavoo.to" in url:
                 key = "vavoo_direct" if bypass_warp else "vavoo"
                 proxy = get_proxy_for_url("vavoo.to", TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp)
@@ -1322,6 +1337,10 @@ class HLSProxy:
             return web.Response(status=401, text="Unauthorized: Invalid API Password")
 
         target_url = request.query.get("url") or request.query.get("d")
+        
+        # Check if it's a native MPD request (no HLS conversion)
+        is_native_mpd = request.path.endswith("/manifest.mpd")
+        
         bypass_warp = (request.query.get("warp", "").lower() == "off")
         token = BYPASS_WARP_CONTEXT.set(bypass_warp)
         proxy_token = SELECTED_PROXY_CONTEXT.set(None)
@@ -1423,6 +1442,44 @@ class HLSProxy:
                     else:
                         stream_url += "?disable_ssl=1"
 
+
+            # --- DASH NATIVO: Riscrive il manifest per segmenti proxati (senza conversione) ---
+            if is_native_mpd:
+                scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
+                host = request.headers.get("X-Forwarded-Host", request.host)
+                proxy_base = f"{scheme}://{host}"
+                
+                # Fetch original manifest if not already captured
+                if not captured_manifest:
+                    async with self.session.get(stream_url, headers=stream_headers) as resp:
+                        if resp.status != 200:
+                            return web.Response(text=f"Failed to fetch original MPD: {resp.status}", status=resp.status)
+                        captured_manifest = await resp.text()
+                        stream_url = str(resp.url)
+
+                # Create DASH session
+                session_id = await self._create_dash_session(
+                    stream_url.rsplit('/', 1)[0] + '/',
+                    stream_headers,
+                    clearkey=request.query.get("clearkey") or f"{request.query.get('key_id')}:{request.query.get('key')}" if request.query.get('key_id') else None
+                )
+
+                rewritten_mpd = ManifestRewriter.rewrite_mpd_native(
+                    manifest_content=captured_manifest,
+                    mpd_url=stream_url,
+                    proxy_base=proxy_base,
+                    stream_headers=stream_headers,
+                    session_id=session_id
+                )
+                
+                return web.Response(
+                    text=rewritten_mpd,
+                    content_type="application/dash+xml",
+                    headers={
+                        "Access-Control-Allow-Origin": "*",
+                        "Cache-Control": "no-cache",
+                    }
+                )
 
             # Se redirect_stream è False, restituisci il JSON con i dettagli (stile MediaFlow)
             if not redirect_stream:
@@ -1678,10 +1735,22 @@ class HLSProxy:
                                 manifest_content = await resp.text()
                                 break # Success
                         
-                        except (AioProxyError, PyProxyError, asyncio.TimeoutError) as e:
+                        except (AioProxyError, PyProxyError, asyncio.TimeoutError, ClientConnectionError, OSError) as e:
                             is_proxy = isinstance(e, (AioProxyError, PyProxyError))
+                            # Consider ClientConnectionError/OSError as proxy errors if a proxy was used
+                            if not is_proxy and mpd_proxy and isinstance(e, (ClientConnectionError, OSError)):
+                                is_proxy = True
+                                
                             err_type = "Proxy" if is_proxy else "Timeout"
                             logger.warning(f"⚠️ [MPD] {err_type} error at attempt {attempt+1}: {e}")
+                            
+                            # Mark local proxy as dead if it failed
+                            if mpd_proxy and "127.0.0.1" in mpd_proxy:
+                                mark_proxy_dead(mpd_proxy)
+                                # Also clear the cached session for this proxy
+                                if mpd_proxy in self.proxy_sessions:
+                                    logger.info(f"   [MPD] Removing broken proxy session from cache: {mpd_proxy}")
+                                    self.proxy_sessions.pop(mpd_proxy, None)
                             
                             # Clear sticky context if it's a proxy error
                             if is_proxy and SELECTED_PROXY_CONTEXT.get():
@@ -1711,6 +1780,17 @@ class HLSProxy:
                         except Exception as e:
                             logger.error(f"❌ [MPD] Unexpected error at attempt {attempt+1}: {e}")
                             if attempt == retries - 1:
+                                # Try one last direct fallback even for unexpected errors
+                                try:
+                                    async with self.session.get(
+                                        stream_url, headers=stream_headers, ssl=ssl_context, allow_redirects=True
+                                    ) as resp:
+                                        if resp.status == 200:
+                                            manifest_content = await resp.text()
+                                            final_mpd_url = str(resp.url)
+                                            logger.info("   [MPD] Direct fallback successful after unexpected error!")
+                                            break
+                                except: pass
                                 return web.Response(text=f"Unexpected error fetching MPD: {e}", status=500)
                             await asyncio.sleep(1)
 
@@ -2052,6 +2132,10 @@ class HLSProxy:
 
             # 1. URL COMPLETO (Solo per il redirect)
             full_proxy_url = f"{proxy_base}{endpoint}?d={encoded_url}{header_params}"
+            
+            # Carry over redirect_stream param for nested redirects
+            if redirect_stream:
+                full_proxy_url += "&redirect_stream=true"
 
             if redirect_stream:
                 logger.debug(f"↪️ Redirecting to: {full_proxy_url}")
@@ -2202,6 +2286,86 @@ class HLSProxy:
         except Exception as e:
             logger.error(f"❌ License proxy error: {str(e)}")
             return web.Response(text=f"License error: {str(e)}", status=500)
+
+    async def handle_dash_segment(self, request):
+        """Proxy for native DASH segments with optional ClearKey decryption."""
+        session_id = request.match_info.get("session_id")
+        path = request.match_info.get("tail")
+        
+        session = await self._get_dash_session(session_id)
+        if not session:
+            return web.Response(text="Session expired or invalid", status=404)
+        
+        base_url, headers, clearkey, init_segment, _ = session
+        segment_url = urljoin(base_url, path)
+        
+        # Parse clearkey into KID and KEY for decrypter
+        kid, key = None, None
+        if clearkey and ":" in clearkey:
+            parts = clearkey.split(":", 1)
+            kid, key = parts[0], parts[1]
+        
+        try:
+            # Check if it's an initialization segment
+            is_init = "init" in path.lower() or "header" in path.lower()
+            
+            # Fetch segment
+            async with self.session.get(segment_url, headers=headers) as resp:
+                if resp.status not in [200, 206]:
+                    return web.Response(status=resp.status)
+                
+                content = await resp.read()
+                
+                if is_init:
+                    # Update session with init segment for subsequent media segments
+                    self.dash_sessions[session_id] = (base_url, headers, clearkey, content, time.time())
+                    return web.Response(body=content, content_type=resp.content_type)
+
+                if kid and key and decrypt_segment:
+                    # Decrypt server-side
+                    try:
+                        decrypted = decrypt_segment(init_segment or b"", content, kid, key)
+                        return web.Response(body=decrypted, content_type=resp.content_type)
+                    except Exception as e:
+                        logger.warning(f"DASH decryption failed for {path}: {e}. Falling back to direct proxy.")
+                
+                return web.Response(body=content, content_type=resp.content_type)
+                
+        except Exception as e:
+            logger.error(f"Error proxying DASH segment {path}: {e}")
+            return web.Response(status=502)
+
+    async def _create_dash_session(self, base_url, headers, clearkey=None):
+        """Creates a new DASH session and returns its ID."""
+        await self._cleanup_dash_sessions()
+        
+        # Deterministic ID based on content to avoid duplicates
+        raw = f"{base_url}|{clearkey}"
+        session_id = hashlib.md5(raw.encode()).hexdigest()[:16]
+        
+        # (base_url, headers, clearkey, init_segment, timestamp)
+        self.dash_sessions[session_id] = (base_url, headers, clearkey, None, time.time())
+        return session_id
+
+    async def _get_dash_session(self, session_id):
+        """Retrieves a DASH session if it's not expired."""
+        session = self.dash_sessions.get(session_id)
+        if not session:
+            return None
+        
+        _, _, _, _, timestamp = session
+        if time.time() - timestamp > self.dash_session_ttl:
+            del self.dash_sessions[session_id]
+            return None
+        
+        return session
+
+    async def _cleanup_dash_sessions(self):
+        """Removes expired DASH sessions."""
+        now = time.time()
+        expired = [sid for sid, (_, _, _, _, ts) in self.dash_sessions.items() if now - ts > self.dash_session_ttl]
+        for sid in expired:
+            del self.dash_sessions[sid]
 
     async def handle_key_request(self, request):
         """✅ NUOVO: Gestisce richieste per chiavi AES-128"""
@@ -2582,6 +2746,7 @@ class HLSProxy:
         
         # Priorità: proxy passato esplicitamente -> proxy in query string
         forced_proxy = forced_proxy or request.query.get("proxy") or None
+
         try:
             # Ping DLStreams extractor to keep browser alive during playback
             # Use robust markers: Daddy's domains, 'premium' pattern, 'mono.css', or Referer/Origin headers
