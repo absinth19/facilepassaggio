@@ -7,8 +7,9 @@ import socket
 from urllib.parse import urlparse
 from aiohttp import ClientSession, ClientTimeout, TCPConnector
 from aiohttp.resolver import DefaultResolver
-from config import FLARESOLVERR_TIMEOUT, FLARESOLVERR_URL, get_connector_for_proxy, get_solver_proxy_url, get_extractor_proxies, get_ordered_proxies_for_url
+from config import FLARESOLVERR_TIMEOUT, FLARESOLVERR_URL, get_connector_for_proxy, get_solver_proxy_url, get_extractor_proxies, get_ordered_proxies_for_url, should_allow_direct_fallback
 from config import PROXY_TEST_TIMEOUT, PROXY_TEST_CONCURRENCY
+from utils.solver_manager import ensure_flaresolverr
 
 
 logger = logging.getLogger(__name__)
@@ -179,7 +180,9 @@ class MaxstreamExtractor:
             logger.debug("curl_cffi not installed, skipping Maxstream browser request")
             return None
 
-        proxies = self._get_proxies_for_url(url) + [None]
+        proxies = self._get_proxies_for_url(url)
+        if should_allow_direct_fallback(proxies):
+            proxies.append(None)
         request_headers = dict(headers or self.base_headers)
         loop = asyncio.get_running_loop()
 
@@ -278,6 +281,7 @@ class MaxstreamExtractor:
                 for key, value in [item.split("=", 1)]
             ]
 
+        await ensure_flaresolverr()
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
