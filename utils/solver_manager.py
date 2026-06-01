@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import sys
+import time
 
 import aiohttp
 
@@ -13,6 +14,8 @@ logger = logging.getLogger(__name__)
 _flaresolverr_process: asyncio.subprocess.Process | None = None
 _flaresolverr_starting = False
 _flaresolverr_lock = asyncio.Lock()
+_flaresolverr_last_used: float = 0.0
+_FLARESOLVERR_IDLE_TIMEOUT = 60  # secondi prima di spegnere FlareSolverr inutilizzato
 
 
 async def _find_flaresolverr_script() -> str | None:
@@ -41,29 +44,39 @@ async def ensure_flaresolverr() -> bool:
 
     Returns True se FlareSolverr è attivo e raggiungibile.
     """
-    global _flaresolverr_process, _flaresolverr_starting
+    global _flaresolverr_process, _flaresolverr_starting, _flaresolverr_last_used
 
     if not FLARESOLVERR_URL:
         return False
 
+    wait_for_start = False
     async with _flaresolverr_lock:
         if _flaresolverr_starting:
-            # Già in fase di avvio da un'altra coroutine
+            _flaresolverr_last_used = time.time()
+            wait_for_start = True
+        elif await _is_flaresolverr_alive():
+            _flaresolverr_last_used = time.time()
             return True
-        # Controlla se già in esecuzione
-        if await _is_flaresolverr_alive():
+        elif _flaresolverr_process and _flaresolverr_process.returncode is None:
+            _flaresolverr_last_used = time.time()
             return True
-        if _flaresolverr_process and _flaresolverr_process.returncode is None:
-            return True
+        else:
+            script = await _find_flaresolverr_script()
+            if not script:
+                logger.warning("FlareSolverr script not found, skipping auto-start")
+                return False
 
-        script = await _find_flaresolverr_script()
-        if not script:
-            logger.warning("FlareSolverr script not found, skipping auto-start")
-            return False
+            fs_dir = os.path.dirname(os.path.dirname(script))
+            logger.info("Starting FlareSolverr lazily from %s ...", fs_dir)
+            _flaresolverr_starting = True
 
-        fs_dir = os.path.dirname(os.path.dirname(script))
-        logger.info("Starting FlareSolverr lazily from %s ...", fs_dir)
-        _flaresolverr_starting = True
+    if wait_for_start:
+        for _ in range(30):
+            await asyncio.sleep(1)
+            if await _is_flaresolverr_alive():
+                _flaresolverr_last_used = time.time()
+                return True
+        return False
 
     # Sblocca il lock durante l'avvero (può richiedere secondi)
     try:
@@ -82,6 +95,7 @@ async def ensure_flaresolverr() -> bool:
                 return False
             if await _is_flaresolverr_alive():
                 logger.info("FlareSolverr is ready")
+                _flaresolverr_last_used = time.time()
                 return True
 
         logger.warning("FlareSolverr failed to start within 30s")
@@ -103,6 +117,14 @@ async def _is_flaresolverr_alive() -> bool:
     except Exception:
         return False
 
+
+async def try_shutdown_idle_flaresolverr():
+    """Ferma FlareSolverr se inattivo oltre il timeout configurato."""
+    global _flaresolverr_process
+    if _flaresolverr_process and _flaresolverr_process.returncode is None:
+        if time.time() - _flaresolverr_last_used > _FLARESOLVERR_IDLE_TIMEOUT:
+            logger.info("FlareSolverr idle >%ss, shutting down", _FLARESOLVERR_IDLE_TIMEOUT)
+            await shutdown_flaresolverr()
 
 async def shutdown_flaresolverr():
     """Ferma FlareSolverr se avviato da noi."""
