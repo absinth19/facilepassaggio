@@ -1,6 +1,59 @@
-from services.proxy_shared import *
+import asyncio
+import hashlib
+import re
+import time
+import urllib.parse
+import aiohttp
+import config_store
+from config import PROXY_SOURCE_LIST, find_first_alive_async
+import services.proxy_shared as _shared
+from services.proxy_shared import (
+    logger,
+    web,
+    yarl,
+    get_browser_activity_extractor,
+    set_response_header,
+    check_vavoo_request,
+    get_ssl_setting_for_url,
+    get_proxy_for_url,
+    HAS_CURL_CFFI,
+    CurlAsyncSession,
+    ClientTimeout,
+    ClientConnectionError,
+    ServerDisconnectedError,
+    ClientPayloadError,
+    AioProxyError,
+    PyProxyError,
+    should_use_short_manifest_urls,
+    ManifestRewriter,
+    MPDToHLSConverter,
+    parse_clearkey_params,
+    decrypt_segment,
+    check_password,
+    prepare_curl_headers,
+    final_curl_request_url,
+    should_use_curl_cffi,
+    is_special_cdn_stream,
+    ProxyDeadRetryError,
+)
 
 class HLSProxyStreamingMixin:
+
+    # Pre-compiled regex for segment URL parsing
+    _SEGMENT_URL_PATTERN = re.compile(r"([-_])(\d+)(\.[^.]+)$")
+
+    @staticmethod
+    async def _write_with_backpressure(response, chunk, max_backlog=131072):
+        """Write chunk with backpressure: drain if write buffer exceeds max_backlog."""
+        await response.write(chunk)
+        try:
+            transport = response.transport
+            if transport is not None and not transport.is_closing():
+                buf_size = transport.get_write_buffer_size()
+                if buf_size > max_backlog:
+                    await response.drain()
+        except (AttributeError, OSError):
+            pass
 
     @staticmethod
     def _trim_cache(cache: dict, max_size: int = 30, trim_count: int = 10):
@@ -57,17 +110,42 @@ class HLSProxyStreamingMixin:
             ext = get_browser_activity_extractor(self.extractors)
             if ext and hasattr(ext, "_update_shared_activity"):
                 ext._update_shared_activity()
-
+            self._touch_extractor_activity(
+                request.query.get("extractor_key"),
+                request.query.get("stream_key"),
+            )
             headers = dict(stream_headers)
             is_special_cdn = is_special_cdn_stream(segment_url)
 
-            def set_response_header(target: dict, name: str, value: str):
-                keys_to_remove = [k for k in target.keys() if k.lower() == name.lower()]
-                for key in keys_to_remove:
-                    del target[key]
-                target[name] = value
+            # Pass headers from query parameters (h_ parameters)
+            for param_name, param_value in request.query.items():
+                if param_name.startswith("h_"):
+                    header_name = param_name[2:]
+                    # Remove duplicate headers case-insensitively
+                    keys_to_remove = [k for k in headers.keys() if k.lower() == header_name.lower()]
+                    for k in keys_to_remove:
+                        del headers[k]
+                    headers[header_name] = param_value
 
-            # Passa attraverso alcuni headers del client
+            # Strip IP/Proxy leak headers
+            for h in ["x-forwarded-for", "x-real-ip", "forwarded", "via"]:
+                headers.pop(h, None)
+                headers.pop(h.lower(), None)
+
+            # Normalize critical headers to Title-Case
+            for key in list(headers.keys()):
+                if key.lower() == "user-agent":
+                    headers["User-Agent"] = headers.pop(key)
+                elif key.lower() == "referer":
+                    headers["Referer"] = headers.pop(key)
+                elif key.lower() == "origin":
+                    headers["Origin"] = headers.pop(key)
+                elif key.lower() == "authorization":
+                    headers["Authorization"] = headers.pop(key)
+                elif key.lower() == "cookie":
+                    headers["Cookie"] = headers.pop(key)
+
+            # Pass through range and validation headers from client
             for header in ["range", "if-none-match", "if-modified-since"]:
                 if header in request.headers:
                     headers[header] = request.headers[header]
@@ -89,26 +167,25 @@ class HLSProxyStreamingMixin:
                     session, _ = await self._get_proxy_session(
                         segment_url, bypass_warp=bypass_warp, forced_proxy=current_proxy
                     )
-                    is_vavoo_req = (
-                        "vavoo" in (request.query.get("h_Referer") or "").lower()
-                        or "vavoo" in (request.query.get("h_Origin") or "").lower()
-                        or "vavoo" in (headers.get("Referer") or "").lower()
-                        or "vavoo" in (headers.get("Origin") or "").lower()
-                        or "vavoo" in (request.headers.get("Referer") or "").lower()
-                        or "vavoo" in segment_url.lower()
-                        or any(x in segment_url.lower() for x in ["/sunshine/", "lokke", "mediahubmx"])
-                    )
-                    disable_ssl = get_ssl_setting_for_url(segment_url, TRANSPORT_ROUTES) or is_vavoo_req
+                    disable_ssl = get_ssl_setting_for_url(segment_url) or check_vavoo_request(headers, request, segment_url)
                     # ✅ Use yarl.URL with encoded=True to prevent double-encoding of commas
                     final_segment_url = yarl.URL(segment_url, encoded=True)
-                    resp_ctx = session.get(final_segment_url, headers=headers, ssl=not disable_ssl)
+                    resp_ctx = session.get(
+                        final_segment_url,
+                        headers=headers,
+                        ssl=not disable_ssl,
+                        timeout=ClientTimeout(total=30, connect=10, sock_connect=10, sock_read=None),
+                    )
                     resp = await resp_ctx.__aenter__()
                     break
                 except (ClientConnectionError, AioProxyError, PyProxyError, asyncio.TimeoutError, OSError) as e:
                     if attempt == 0 and current_proxy:
                         logger.warning("Segment proxy %s failed for %s: %r. Retrying with a different proxy.", current_proxy, segment_name, e)
-                        mark_proxy_dead(current_proxy)
-                        new_proxy = get_proxy_for_url(segment_url, TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp)
+                        self._mark_proxy_dead_if_allowed(
+                            current_proxy,
+                            extractor_key=request.query.get("extractor_key"),
+                        )
+                        new_proxy = get_proxy_for_url(segment_url, bypass_warp=bypass_warp)
                         if new_proxy and new_proxy != current_proxy:
                             current_proxy = new_proxy
                             continue
@@ -157,7 +234,7 @@ class HLSProxyStreamingMixin:
                         if first_chunk:
                             chunk = self._strip_fake_png_header_from_ts(chunk)
                             first_chunk = False
-                        await response.write(chunk)
+                        await self._write_with_backpressure(response, chunk)
                     await response.write_eof()
                     return response
                 except (ClientPayloadError, ConnectionResetError, OSError) as e:
@@ -195,21 +272,17 @@ class HLSProxyStreamingMixin:
         request._ps_forced_proxy = forced_proxy
         session_proxy = None
 
-        async def retry_direct_after_warp(reason):
-            return None
         try:
             # Ping browser-based extractors to keep shared browser alive
             ext = get_browser_activity_extractor(self.extractors)
             if ext and hasattr(ext, "_update_shared_activity"):
                 ext._update_shared_activity()
+            self._touch_extractor_activity(
+                request.query.get("extractor_key"),
+                request.query.get("stream_key"),
+            )
 
             headers = dict(stream_headers)
-
-            def set_response_header(target: dict, name: str, value: str):
-                keys_to_remove = [k for k in target.keys() if k.lower() == name.lower()]
-                for key in keys_to_remove:
-                    del target[key]
-                target[name] = value
 
             # Passa attraverso alcuni headers del client, ma FILTRA quelli che potrebbero leakare l'IP
             # Rimuoviamo specificamente i condizionali che possono causare 412/416 con URL dinamici
@@ -271,21 +344,12 @@ class HLSProxyStreamingMixin:
             # Log headers finali per debug
             # logger.info(f"   Final Stream Headers: {headers}")
 
-            # ✅ NUOVO: Determina se disabilitare SSL per questo dominio
-            is_vavoo_req = (
-                "vavoo" in (request.query.get("h_Referer") or "").lower()
-                or "vavoo" in (request.query.get("h_Origin") or "").lower()
-                or "vavoo" in (headers.get("Referer") or "").lower()
-                or "vavoo" in (headers.get("Origin") or "").lower()
-                or "vavoo" in (request.headers.get("Referer") or "").lower()
-                or "vavoo" in stream_url.lower()
-                or any(x in stream_url.lower() for x in ["/sunshine/", "lokke", "mediahubmx"])
-            )
+            is_vavoo_req = check_vavoo_request(headers, request, stream_url)
             disable_ssl = (
                 request.query.get("h_X-EasyProxy-Disable-SSL") == "1"
                 or request.query.get("disable_ssl") == "1"
                 or headers.get("X-EasyProxy-Disable-SSL") == "1"
-                or get_ssl_setting_for_url(stream_url, TRANSPORT_ROUTES)
+                or get_ssl_setting_for_url(stream_url)
                 or is_vavoo_req
             )
             headers.pop("X-EasyProxy-Disable-SSL", None)
@@ -321,7 +385,8 @@ class HLSProxyStreamingMixin:
 
                 # ✅ FIX LOG: Determine correct routing for display
                 if session_proxy:
-                    routing = f"WARP (Cloudflare IP)" if (WARP_PROXY_URL and session_proxy == WARP_PROXY_URL) else f"PROXY ({session_proxy})"
+                    _WARP_PROXY_URL = _shared.WARP_PROXY_URL
+                    routing = f"WARP (Cloudflare IP)" if (_WARP_PROXY_URL and session_proxy == _WARP_PROXY_URL) else f"PROXY ({session_proxy})"
                 else:
                     routing = "BYPASS (Real IP)"
 
@@ -335,6 +400,11 @@ class HLSProxyStreamingMixin:
                 is_special_cdn,
                 HAS_CURL_CFFI,
             )
+            is_hls_segment_request = request.path.startswith("/proxy/hls/segment.")
+            # ✅ FIX BUFFERING: Use generous sock_read for segments via slow proxies.
+            # sock_read=None prevents SocketTimeoutError mid-transfer on large 1080p
+            # segments; the total timeout still caps the overall request duration.
+            segment_timeout = ClientTimeout(total=30, connect=10, sock_connect=10, sock_read=None)
 
             if use_curl_cffi:
                 logger.info(f"🚀 [curl_cffi] Using browser impersonation for: {stream_url}")
@@ -407,7 +477,12 @@ class HLSProxyStreamingMixin:
                     request_target = urllib.parse.unquote(stream_url)
                 else:
                     request_target = yarl.URL(stream_url, encoded=True)
-                resp_ctx = session.get(request_target, headers=headers, ssl=not disable_ssl)
+                resp_ctx = session.get(
+                    request_target,
+                    headers=headers,
+                    ssl=not disable_ssl,
+                    timeout=segment_timeout if is_hls_segment_request else None,
+                )
 
             async def retry_hls_segment_with_fresh_token():
                 if not request.path.startswith("/proxy/hls/segment."):
@@ -438,7 +513,7 @@ class HLSProxyStreamingMixin:
                 retry_disable_ssl = (
                     request.query.get("h_X-EasyProxy-Disable-SSL") == "1"
                     or request.query.get("disable_ssl") == "1"
-                    or get_ssl_setting_for_url(refreshed_url, TRANSPORT_ROUTES)
+                    or get_ssl_setting_for_url(refreshed_url)
                 )
 
                 try:
@@ -446,11 +521,12 @@ class HLSProxyStreamingMixin:
                         yarl.URL(refreshed_url, encoded=True),
                         headers=headers,
                         ssl=not retry_disable_ssl,
+                        timeout=segment_timeout,
                     ) as retry_resp:
                         if retry_resp.status not in [200, 206]:
                             retry_routing = (
                                 f"WARP ({retry_proxy})"
-                                if retry_proxy and WARP_PROXY_URL and retry_proxy == WARP_PROXY_URL
+                                if retry_proxy and _shared.WARP_PROXY_URL and retry_proxy == _shared.WARP_PROXY_URL
                                 else ("BYPASS" if retry_proxy is None else f"PROXY ({retry_proxy})")
                             )
                             logger.warning(
@@ -509,7 +585,11 @@ class HLSProxyStreamingMixin:
                     return None
                 old_proxy = session_proxy
                 logger.info("Rotating proxy after upstream error on %s", old_proxy)
-                mark_proxy_dead(old_proxy, dead_duration=120)
+                self._mark_proxy_dead_if_allowed(
+                    old_proxy,
+                    dead_duration=120,
+                    extractor_key=request.query.get("extractor_key"),
+                )
                 if old_proxy in self.proxy_sessions:
                     old = self.proxy_sessions.pop(old_proxy, None)
                     if old and not old.closed:
@@ -525,7 +605,7 @@ class HLSProxyStreamingMixin:
                 # 1) Direct retry of same URL via new proxy
                 try:
                     rot_target = yarl.URL(stream_url, encoded=True) if not is_special_cdn else urllib.parse.unquote(stream_url)
-                    async with rot_session.get(rot_target, headers=headers, ssl=not disable_ssl) as rot_resp:
+                    async with rot_session.get(rot_target, headers=headers, ssl=not disable_ssl, timeout=segment_timeout) as rot_resp:
                         if rot_resp.status in [200, 206]:
                             logger.info("Proxy rotation successful (direct): %s -> %s", old_proxy, rot_proxy or "direct")
                             rot_body = await rot_resp.read()
@@ -549,7 +629,7 @@ class HLSProxyStreamingMixin:
                             for _ in range(2):
                                 try:
                                     fr_target = yarl.URL(fresh_url, encoded=True)
-                                    async with rot_session.get(fr_target, headers=headers, ssl=not disable_ssl) as fr_resp:
+                                    async with rot_session.get(fr_target, headers=headers, ssl=not disable_ssl, timeout=segment_timeout) as fr_resp:
                                         if fr_resp.status in [200, 206]:
                                             logger.info("Proxy rotation successful (re-extract): %s -> %s", old_proxy, rot_proxy or "direct")
                                             fr_body = await fr_resp.read()
@@ -560,6 +640,41 @@ class HLSProxyStreamingMixin:
                                     await asyncio.sleep(0.5)
                 except Exception as exc:
                     logger.debug("Proxy rotation re-extract failed: %s", exc)
+                return None
+
+            async def retry_same_segment_after_payload_error(reason):
+                if not request.path.startswith("/proxy/hls/segment."):
+                    return None
+                retry_target = urllib.parse.unquote(stream_url) if is_special_cdn else yarl.URL(stream_url, encoded=True)
+                for attempt in range(2):
+                    await asyncio.sleep(0.15 * (attempt + 1))
+                    try:
+                        retry_session, _ = await self._get_proxy_session(
+                            stream_url, bypass_warp=bypass_warp, forced_proxy=forced_proxy,
+                        )
+                        async with retry_session.get(retry_target, headers=headers, ssl=not disable_ssl, timeout=segment_timeout) as retry_resp:
+                            if retry_resp.status not in [200, 206]:
+                                logger.debug(
+                                    "Segment payload retry got status %s for %s",
+                                    retry_resp.status,
+                                    stream_url,
+                                )
+                                continue
+                            retry_body = await retry_resp.read()
+                            logger.info(
+                                "✅ [Recupero] Segmento ripristinato (%d/2) per %s (%s)",
+                                attempt + 1,
+                                stream_url.split('/')[-1].split('?')[0],
+                                type(reason).__name__,
+                            )
+                            return retry_body, retry_resp.headers, retry_resp.status
+                    except (ClientPayloadError, ConnectionResetError, OSError, asyncio.TimeoutError) as exc:
+                        logger.debug(
+                            "Segment payload retry %d failed for %s: %r",
+                            attempt + 1,
+                            stream_url,
+                            exc,
+                        )
                 return None
 
             async with resp_ctx as resp:
@@ -573,9 +688,6 @@ class HLSProxyStreamingMixin:
                         rot_response = await retry_with_different_proxy()
                         if rot_response:
                             return rot_response
-                    warp_retry_response = await retry_direct_after_warp(f"upstream status {resp.status}")
-                    if warp_retry_response:
-                        return warp_retry_response
                     if is_special_cdn and resp.status == 403 and not goto_manifest_processing:
                         retry_result = await self._retry_special_cdn_request(
                             request_target,
@@ -595,31 +707,11 @@ class HLSProxyStreamingMixin:
                                 headers=retry_headers,
                             )
                     if resp.status == 403 and request.path.endswith("manifest.m3u8"):
-                        try:
-                            rewritten_manifest = await recover_forbidden_manifest(
-                                self,
-                                request,
-                                stream_url,
-                                headers,
-                                bypass_warp,
-                                forced_proxy,
-                            )
-                            if rewritten_manifest:
-                                logger.info("Manifest recovered via provider hook after upstream 403")
-                                return web.Response(
-                                    text=rewritten_manifest,
-                                    headers={
-                                        "Content-Type": "application/vnd.apple.mpegurl",
-                                        "Access-Control-Allow-Origin": "*",
-                                        "Cache-Control": "no-cache",
-                                    },
-                                )
-                        except Exception as exc:
-                            logger.debug("Manifest 403 recovery hook failed for %s: %s", stream_url, exc)
-                    error_body = await resp.read()
+                        logger.debug("Upstream 403 on manifest, skipping recovery (browser fallback disabled): %s", stream_url)
+                    error_body = await resp.content.read(4096) or b""
                     routing = (
                         f"WARP ({session_proxy})"
-                        if session_proxy and WARP_PROXY_URL and session_proxy == WARP_PROXY_URL
+                        if session_proxy and _shared.WARP_PROXY_URL and session_proxy == _shared.WARP_PROXY_URL
                         else ("BYPASS" if session_proxy is None else f"PROXY ({session_proxy})")
                     )
                     logger.warning(f"⚠️ Upstream returned error {resp.status} for {stream_url} [Routing: {routing}]")
@@ -629,9 +721,22 @@ class HLSProxyStreamingMixin:
                     "video/" in content_type or stream_url.lower().endswith((".mp4", ".mkv", ".avi", ".mov"))
                 )
 
-                if is_direct_media_stream:
+                # ✅ FIX BUFFERING: Stream HLS segments chunk-by-chunk
+                # instead of buffering entirely with resp.read(). This prevents
+                # SocketTimeoutError on large segments via slow proxies and
+                # reduces perceived latency for the player.
+                is_segment_like = (
+                    is_hls_segment_request
+                    and any(stream_url.lower().split('?')[0].endswith(ext) for ext in
+                            ['.ts', '.m4s', '.aac', '.m4a', '.m4v', '.m4i', '.mp4', '.mkv', '.avi', '.mov'])
+                    and 'mpegurl' not in content_type
+                    and not content_type.startswith('text/')
+                )
+
+                if is_direct_media_stream or is_segment_like:
+                    seg_content_type = "video/MP2T" if is_segment_like else content_type
                     response_headers = {
-                        "Content-Type": content_type,
+                        "Content-Type": seg_content_type,
                         "Access-Control-Allow-Origin": "*",
                         "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
                         "Access-Control-Allow-Headers": "Range, Content-Type",
@@ -642,8 +747,12 @@ class HLSProxyStreamingMixin:
                     response = web.StreamResponse(status=resp.status, headers=response_headers)
                     await response.prepare(request)
                     try:
+                        first_chunk = True
                         async for chunk in resp.content.iter_any():
-                            await response.write(chunk)
+                            if first_chunk and is_segment_like:
+                                chunk = self._strip_fake_png_header_from_ts(chunk)
+                                first_chunk = False
+                            await self._write_with_backpressure(response, chunk)
                         await response.write_eof()
                         return response
                     except (ClientPayloadError, ConnectionResetError, OSError) as e:
@@ -663,13 +772,28 @@ class HLSProxyStreamingMixin:
                             )
                         return response
 
-                content_bytes = await resp.read()
+                response_source_headers = resp.headers
+                response_status = resp.status
+                try:
+                    content_bytes = await resp.read()
+                except (ClientPayloadError, ConnectionResetError, OSError) as e:
+                    # Invalida la sessione nel pool prima del retry
+                    if session_proxy and session_proxy in self.proxy_sessions:
+                        stale = self.proxy_sessions.pop(session_proxy, None)
+                        if stale and not stale.closed:
+                            await stale.close()
+                    retry_result = await retry_same_segment_after_payload_error(e)
+                    if not retry_result:
+                        raise
+                    content_bytes, response_source_headers, response_status = retry_result
                 manifest_content = None
                 try:
                     decoded_text = content_bytes.decode("utf-8", errors='replace')
                     if decoded_text.lstrip().startswith("#EXTM3U"):
                         manifest_content = decoded_text
-                except: pass
+                except Exception:
+                    logger.debug("Response is not valid UTF-8 text (expected for segments)")
+                    pass
 
                 if manifest_content is None and (".m3u8" in stream_url or "mpegurl" in content_type):
                     try:
@@ -705,7 +829,19 @@ class HLSProxyStreamingMixin:
                         str(resp.url),
                     )
 
-                    disable_ssl = request.query.get("disable_ssl") == "1" or get_ssl_setting_for_url(str(resp.url), TRANSPORT_ROUTES)
+                    disable_ssl = request.query.get("disable_ssl") == "1" or get_ssl_setting_for_url(str(resp.url))
+
+                    # Check manifest cache
+                    cache_key = hashlib.md5(str(resp.url).encode()).hexdigest()
+                    if cache_key in self._manifest_cache:
+                        cached, cached_at = self._manifest_cache[cache_key]
+                        if time.time() - cached_at < self._manifest_cache_ttl:
+                            return web.Response(text=cached, headers={
+                                "Content-Type": "application/vnd.apple.mpegurl",
+                                "Access-Control-Allow-Origin": "*",
+                                "Cache-Control": "no-cache",
+                            })
+
                     rewritten = await ManifestRewriter.rewrite_manifest_urls(
                         manifest_content=manifest_content,
                         base_url=str(resp.url),
@@ -720,7 +856,11 @@ class HLSProxyStreamingMixin:
                         disable_ssl=disable_ssl,
                         selected_proxy=forced_proxy, # ✅ PASSA IL PROXY FORZATO
                         force_direct=force_direct,
+                        extractor_key=request.query.get("extractor_key"),
+                        stream_key=request.query.get("stream_key"),
                     )
+                    self._manifest_cache[cache_key] = (rewritten, time.time())
+                    self._trim_cache(self._manifest_cache, max_size=100, trim_count=20)
                     return web.Response(text=rewritten, headers={
                         "Content-Type": "application/vnd.apple.mpegurl",
                         "Access-Control-Allow-Origin": "*",
@@ -737,40 +877,11 @@ class HLSProxyStreamingMixin:
                     proxy_base = f"{scheme}://{host}"
 
                     # Recupera parametri
-                    clearkey_param = request.query.get("clearkey")
-
-                    # ✅ FIX: Supporto per key_id e key separati (stile MediaFlowProxy)
-                    if not clearkey_param:
-                        key_id_param = request.query.get("key_id")
-                        key_val_param = request.query.get("key")
-
-                        if key_id_param and key_val_param:
-                            # Check for multiple keys
-                            key_ids = key_id_param.split(",")
-                            key_vals = key_val_param.split(",")
-
-                            if len(key_ids) == len(key_vals):
-                                clearkey_parts = []
-                                for kid, kval in zip(key_ids, key_vals):
-                                    clearkey_parts.append(
-                                        f"{kid.strip()}:{kval.strip()}"
-                                    )
-                                clearkey_param = ",".join(clearkey_parts)
-                            else:
-                                if len(key_ids) == 1 and len(key_vals) == 1:
-                                    clearkey_param = f"{key_id_param}:{key_val_param}"
-                                else:
-                                    # Try to pair as many as possible
-                                    min_len = min(len(key_ids), len(key_vals))
-                                    clearkey_parts = []
-                                    for i in range(min_len):
-                                        clearkey_parts.append(
-                                            f"{key_ids[i].strip()}:{key_vals[i].strip()}"
-                                        )
-                                    clearkey_param = ",".join(clearkey_parts)
+                    clearkey_param = parse_clearkey_params(request)
 
                     # --- LEGACY MODE: MPD -> HLS Conversion ---
-                    if MPD_MODE in ("legacy", "none", "disabled") and MPDToHLSConverter:
+                    _MPD_MODE = _shared.MPD_MODE
+                    if _MPD_MODE in ("legacy", "none", "disabled") and MPDToHLSConverter:
                         logger.info(
                             f"🔄 [Legacy Mode] Converting MPD to HLS for {stream_url}"
                         )
@@ -862,8 +973,8 @@ class HLSProxyStreamingMixin:
                     "last-modified",
                     "etag",
                 ]:
-                    if header in resp.headers:
-                        response_headers[header] = resp.headers[header]
+                    if header in response_source_headers:
+                        response_headers[header] = response_source_headers[header]
 
                 # ✅ FIX: Forza Content-Type coerente se il server non lo invia correttamente
                 if (
@@ -910,24 +1021,30 @@ class HLSProxyStreamingMixin:
 
                 return web.Response(
                     body=content_bytes,
-                    status=resp.status,
+                    status=response_status,
                     headers=response_headers,
                 )
 
 
         except (ClientPayloadError, ConnectionResetError, OSError) as e:
-            # Errori tipici di disconnessione del client (o proxy caduto/disconnesso mid-stream)
+            # Errori tipici di disconnessione client o payload troncato durante stream.
+            # Non punire il proxy: i player HLS cancellano spesso richieste in corso.
             active_proxy = session_proxy or forced_proxy
             if active_proxy:
-                logger.warning(
-                    "Proxy %s failed during stream fetch (payload/reset error): %r. Marking dead.",
+                logger.info(
+                    "Stream interrupted while using proxy %s (payload/reset): %r.",
                     active_proxy, e
                 )
-                mark_proxy_dead(active_proxy)
-            warp_retry_response = await retry_direct_after_warp(e)
-            if warp_retry_response:
-                return warp_retry_response
-            logger.info(f"ℹ️ Client disconnected from stream: {stream_url} ({str(e)})")
+            # ✅ FIX BUFFERING: Only invalidate the proxy session for real connection
+            # errors (ConnectionResetError), NOT for read timeouts (SocketTimeoutError).
+            # Read timeouts on slow proxies are transient and don't mean the session is
+            # broken — recreating it adds ~1-2s reconnection latency that causes buffering.
+            is_read_timeout = 'Timeout on reading' in str(e) or 'TimeoutError' in type(e).__name__
+            if not is_read_timeout and session_proxy and session_proxy in self.proxy_sessions:
+                stale = self.proxy_sessions.pop(session_proxy, None)
+                if stale and not stale.closed:
+                    await stale.close()
+            logger.info(f"[INFO] Client disconnected from stream: {stream_url} ({str(e)})")
             return web.Response(text="Client disconnected", status=499)
 
         except (
@@ -939,13 +1056,18 @@ class HLSProxyStreamingMixin:
             active_proxy = session_proxy or forced_proxy
             if active_proxy:
                 logger.warning(
-                    "Proxy %s failed connection to source: %r. Marking dead.",
+                    "Proxy %s failed connection to source: %r.",
                     active_proxy, e
                 )
-                mark_proxy_dead(active_proxy)
-            warp_retry_response = await retry_direct_after_warp(e)
-            if warp_retry_response:
-                return warp_retry_response
+                self._mark_proxy_dead_if_allowed(
+                    active_proxy,
+                    extractor_key=request.query.get("extractor_key"),
+                )
+            # Invalida la sessione nel pool per evitare che i retry successivi riusino una connessione rotta
+            if session_proxy and session_proxy in self.proxy_sessions:
+                stale = self.proxy_sessions.pop(session_proxy, None)
+                if stale and not stale.closed:
+                    await stale.close()
             logger.warning(f"⚠️ Connection lost with source: {stream_url} ({str(e)})")
             return web.Response(text=f"Upstream connection lost: {str(e)}", status=502)
 
@@ -955,19 +1077,15 @@ class HLSProxyStreamingMixin:
                 active_proxy = session_proxy or forced_proxy
                 if active_proxy:
                     logger.warning(
-                        "Proxy %s connection lost/reset: %r. Marking dead.",
+                        "Proxy %s connection lost/reset: %r.",
                         active_proxy, e
                     )
-                    mark_proxy_dead(active_proxy)
-                warp_retry_response = await retry_direct_after_warp(e)
-                if warp_retry_response:
-                    return warp_retry_response
-                logger.info(f"ℹ️ Stream connection closed by client or server: {stream_url}")
+                    self._mark_proxy_dead_if_allowed(
+                        active_proxy,
+                        extractor_key=request.query.get("extractor_key"),
+                    )
+                logger.info(f"[INFO] Stream connection closed by client or server: {stream_url}")
                 return web.Response(text="Connection lost", status=499)
-
-            warp_retry_response = await retry_direct_after_warp(e)
-            if warp_retry_response:
-                return warp_retry_response
 
             # If forced_proxy was set and failed with a proxy/connection error, re-extract
             forced_proxy = getattr(request, '_ps_forced_proxy', None)
@@ -976,9 +1094,12 @@ class HLSProxyStreamingMixin:
                 is_proxy_err = any(x in err_lower for x in ("invalid reply", "request rejected", "connection refused", "connection reset", "proxy connection timed out", "can't connect to server", "couldn't connect", "connect call failed", "0x9", "0x7", "socks5"))
                 if is_proxy_err:
                     request._ps_retried = True
-                    logger.warning("Proxy %s failed for %s, marking dead and triggering re-extraction", forced_proxy, stream_url)
-                    mark_proxy_dead(forced_proxy)
-                    raise Exception("PROXY_DEAD_RETRY_EXTRACTION")
+                    logger.warning("Proxy %s failed for %s, checking dead policy and triggering re-extraction", forced_proxy, stream_url)
+                    self._mark_proxy_dead_if_allowed(
+                        forced_proxy,
+                        extractor_key=request.query.get("extractor_key"),
+                    )
+                    raise ProxyDeadRetryError("PROXY_DEAD_RETRY_EXTRACTION")
 
             logger.error(
                 "❌ Generic error in stream proxy [%s]: %r",
@@ -987,7 +1108,7 @@ class HLSProxyStreamingMixin:
             )
             return web.Response(text=f"Stream error: {err_msg}", status=500)
 
-    def _prefetch_next_segments(
+    async def _prefetch_next_segments(
         self, current_url, init_url, key, key_id, headers, bypass_warp: bool = False
     ):
         """Identifica i prossimi segmenti e avvia il download in background."""
@@ -995,8 +1116,7 @@ class HLSProxyStreamingMixin:
             parsed = urllib.parse.urlparse(current_url)
             path = parsed.path
 
-            # Cerca pattern numerico alla fine del path (es. segment-1.m4s)
-            match = re.search(r"([-_])(\d+)(\.[^.]+)$", path)
+            match = self._SEGMENT_URL_PATTERN.search(path)
             if not match:
                 return
 
@@ -1017,22 +1137,23 @@ class HLSProxyStreamingMixin:
 
                 cache_key = f"{next_url}:{key_id}"
 
-                if (
-                    cache_key not in self.segment_cache
-                    and cache_key not in self.prefetch_tasks
-                ):
-                    self.prefetch_tasks.add(cache_key)
-                    asyncio.create_task(
-                        self._fetch_and_cache_segment(
-                            next_url,
-                            init_url,
-                            key,
-                            key_id,
-                            headers,
-                            cache_key,
-                            bypass_warp=bypass_warp,
+                async with self._prefetch_lock:
+                    if (
+                        cache_key not in self.segment_cache
+                        and cache_key not in self.prefetch_tasks
+                    ):
+                        self.prefetch_tasks.add(cache_key)
+                        asyncio.create_task(
+                            self._fetch_and_cache_segment(
+                                next_url,
+                                init_url,
+                                key,
+                                key_id,
+                                headers,
+                                cache_key,
+                                bypass_warp=bypass_warp,
+                            )
                         )
-                    )
 
         except Exception as e:
             logger.warning(f"⚠️ Prefetch error: {e}")
@@ -1041,69 +1162,68 @@ class HLSProxyStreamingMixin:
         self, url, init_url, key, key_id, headers, cache_key, bypass_warp: bool = False
     ):
         """Scarica, decripta e mette in cache un segmento in background."""
-        try:
-            if decrypt_segment is None:
-                return
-
-            # Ensure dynamic WARP bypass for prefetch
-            self._check_dynamic_warp_bypass(url)
-
-            session, _ = await self._get_proxy_session(url, bypass_warp=bypass_warp)
-
-            # Download Init (usa cache se possibile)
-            init_content = b""
-            if init_url:
-                if init_url in self.init_cache:
-                    init_content = self.init_cache[init_url]
-                else:
-                    disable_ssl = get_ssl_setting_for_url(init_url, TRANSPORT_ROUTES)
-                    try:
-                        async with session.get(
-                            init_url,
-                            headers=headers,
-                            ssl=not disable_ssl,
-                            timeout=aiohttp.ClientTimeout(total=10),
-                        ) as resp:
-                            if resp.status == 200:
-                                init_content = await resp.read()
-                                self.init_cache[init_url] = init_content
-                                self._trim_cache(self.init_cache)
-                    except Exception:
-                        pass
-
-            # Download Segment
-            segment_content = None
-            disable_ssl = get_ssl_setting_for_url(url, TRANSPORT_ROUTES)
+        async with self._prefetch_semaphore:
             try:
-                async with session.get(
-                    url,
-                    headers=headers,
-                    ssl=not disable_ssl,
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as resp:
-                    if resp.status == 200:
-                        segment_content = await resp.read()
-            except Exception:
-                pass
+                if decrypt_segment is None:
+                    return
 
-            if segment_content:
-                # Decrypt
-                # Decrypt in thread pool to avoid blocking event loop
-                loop = asyncio.get_event_loop()
-                decrypted_content = await loop.run_in_executor(
-                    None, decrypt_segment, init_content, segment_content, key_id, key
-                )
-                import time
+                # Ensure dynamic WARP bypass for prefetch
+                await self._check_dynamic_warp_bypass(url)
 
-                self.segment_cache[cache_key] = (decrypted_content, time.time())
-                self._trim_cache(self.segment_cache)
-                logger.info(f"📦 Prefetched segment: {url.split('/')[-1]}")
+                session, _ = await self._get_proxy_session(url, bypass_warp=bypass_warp)
 
-        except Exception as e:
-            pass
-        finally:
-            if cache_key in self.prefetch_tasks:
-                self.prefetch_tasks.remove(cache_key)
+                # Download Init (usa cache se possibile)
+                init_content = b""
+                if init_url:
+                    if init_url in self.init_cache:
+                        init_content = self.init_cache[init_url]
+                    else:
+                        disable_ssl = get_ssl_setting_for_url(init_url)
+                        try:
+                            async with session.get(
+                                init_url,
+                                headers=headers,
+                                ssl=not disable_ssl,
+                                timeout=aiohttp.ClientTimeout(total=10),
+                            ) as resp:
+                                if resp.status == 200:
+                                    init_content = await resp.read()
+                                    self.init_cache[init_url] = init_content
+                                    self._trim_cache(self.init_cache)
+                        except Exception as e:
+                            logger.debug("Failed to cache init segment %s: %s", init_url, e)
+
+                # Download Segment
+                segment_content = None
+                disable_ssl = get_ssl_setting_for_url(url)
+                try:
+                    async with session.get(
+                        url,
+                        headers=headers,
+                        ssl=not disable_ssl,
+                        timeout=aiohttp.ClientTimeout(total=15),
+                    ) as resp:
+                        if resp.status == 200:
+                            segment_content = await resp.read()
+                except Exception as e:
+                    logger.debug("Failed to fetch segment %s: %s", url, e)
+
+                if segment_content:
+                    # Decrypt in thread pool to avoid blocking event loop
+                    loop = asyncio.get_event_loop()
+                    decrypted_content = await loop.run_in_executor(
+                        None, decrypt_segment, init_content, segment_content, key_id, key
+                    )
+
+                    self.segment_cache[cache_key] = (decrypted_content, time.time())
+                    self._trim_cache(self.segment_cache)
+                    logger.info(f"📦 Prefetched segment: {url.split('/')[-1]}")
+
+            except Exception as e:
+                logger.debug("Segment prefetch failed for %s: %s", url.split('/')[-1], e)
+            finally:
+                if cache_key in self.prefetch_tasks:
+                    self.prefetch_tasks.remove(cache_key)
 
     async def _remux_to_ts(self, content):
         """Converte segmenti (fMP4) in MPEG-TS usando FFmpeg pipe."""
@@ -1168,12 +1288,11 @@ class HLSProxyStreamingMixin:
             )
 
         # Check cache first
-        import time
 
         cache_key = f"{url}:{key_id}:ts"  # Use distinct cache key for TS
         if cache_key in self.segment_cache:
             cached_content, cached_time = self.segment_cache[cache_key]
-            if time.time() - cached_time < self.segment_cache_ttl:
+            if time.time() - cached_time < config_store.get("segment_cache_ttl", 30):
                 logger.info(f"📦 Cache HIT for segment: {url.split('/')[-1]}")
                 return web.Response(
                     body=cached_content,
@@ -1211,7 +1330,7 @@ class HLSProxyStreamingMixin:
                         return b""
                     if init_url in self.init_cache:
                         return self.init_cache[init_url]
-                    disable_ssl = get_ssl_setting_for_url(init_url, TRANSPORT_ROUTES)
+                    disable_ssl = get_ssl_setting_for_url(init_url)
                     try:
                         async with segment_session.get(
                             init_url,
@@ -1233,7 +1352,7 @@ class HLSProxyStreamingMixin:
                         return None
 
                 async def fetch_segment():
-                    disable_ssl = get_ssl_setting_for_url(url, TRANSPORT_ROUTES)
+                    disable_ssl = get_ssl_setting_for_url(url)
                     try:
                         async with segment_session.get(
                             url,
@@ -1284,7 +1403,7 @@ class HLSProxyStreamingMixin:
                 )
 
             # Leggero REMUX to TS (if enabled)
-            if ENABLE_REMUXING:
+            if _shared.ENABLE_REMUXING:
                 ts_content = await self._remux_to_ts(combined_content)
                 if not ts_content:
                     logger.warning("⚠️ Remux failed, serving raw fMP4")
@@ -1303,7 +1422,7 @@ class HLSProxyStreamingMixin:
             self._trim_cache(self.segment_cache)
 
             # Prefetch next segments in background
-            self._prefetch_next_segments(
+            await self._prefetch_next_segments(
                 url, init_url, key, key_id, headers, bypass_warp=bypass_warp
             )
 

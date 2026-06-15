@@ -1,4 +1,6 @@
-from services.proxy_shared import ENABLE_WARP, PlaylistBuilder, logger
+from services.proxy_shared import PlaylistBuilder, logger
+import asyncio
+import os
 from services.proxy_core import HLSProxyCoreMixin
 from services.proxy_dash import HLSProxyDashMixin
 from services.proxy_handlers import HLSProxyHandlersMixin
@@ -18,6 +20,7 @@ class HLSProxy(
     def __init__(self, ffmpeg_manager=None):
         self.extractors = {}
         self._extractor_atimes = {}
+        self._extractor_stream_atimes = {}
         self.ffmpeg_manager = ffmpeg_manager
 
         # Inizializza il playlist_builder se il modulo è disponibile
@@ -32,10 +35,13 @@ class HLSProxy(
 
         # Cache per segmenti decriptati (URL -> (content, timestamp))
         self.segment_cache = {}
-        self.segment_cache_ttl = 30  # Seconds
 
         # Prefetch queue for background downloading
         self.prefetch_tasks = set()
+        self._prefetch_semaphore = asyncio.Semaphore(5)
+        self._prefetch_lock = asyncio.Lock()
+        self._manifest_cache = {}
+        self._manifest_cache_ttl = 5
 
         # Sessione condivisa per il proxy (no proxy)
         self.session = None
@@ -50,9 +56,14 @@ class HLSProxy(
         self._proxy_session_atimes = {}  # proxy_url -> last access time
         self.curl_sessions = {}  # Registry for pooled curl_cffi sessions
 
+        # Template cache (read once, serve many)
+        self._template_cache = {}
+        self._template_cache_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "templates")
+
         # Version information
         self.latest_version = "Checking..."
-        self.warp_status = "Checking..." if ENABLE_WARP else "Disabled"
+        self.warp_status = "Checking..."
+        self._warp_ip = ""
 
         # Registry for DASH native sessions (to handle segment proxying without HLS conversion)
         # session_id -> (base_url, headers, clearkey, timestamp)

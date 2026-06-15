@@ -1,4 +1,20 @@
-from services.proxy_shared import *
+from services.proxy_shared import (
+    logger,
+    check_password,
+    web,
+    BYPASS_WARP_CONTEXT,
+    BYPASS_PROXIES_CONTEXT,
+    SELECTED_PROXY_CONTEXT,
+    STRICT_PROXY_CONTEXT,
+    check_vavoo_request,
+    ManifestRewriter,
+)
+import config_store
+from extractors.provider_hooks import requires_captured_manifest_proxy
+from config import FLARESOLVERR_URL
+import asyncio
+import base64
+import urllib.parse
 
 
 class HLSProxyExtractorHandlerMixin:
@@ -17,9 +33,13 @@ class HLSProxyExtractorHandlerMixin:
 
         bypass_warp = request.query.get("warp", "").lower() == "off"
         token = BYPASS_WARP_CONTEXT.set(bypass_warp)
+        
+        bypass_proxies = request.query.get("proxy", "").lower() == "off"
+        proxy_bypass_token = BYPASS_PROXIES_CONTEXT.set(bypass_proxies)
+        
         selected_proxy = None
         raw_proxy = request.query.get("proxy")
-        if raw_proxy:
+        if raw_proxy and raw_proxy.lower() != "off":
             selected_proxy = urllib.parse.unquote(raw_proxy)
             if "://" not in selected_proxy and "%3a" in selected_proxy.lower():
                 selected_proxy = urllib.parse.unquote(selected_proxy)
@@ -122,13 +142,42 @@ class HLSProxyExtractorHandlerMixin:
             extractor_kwargs.pop('d', None)   # Remove to avoid duplicate argument error
             extractor_kwargs['request_headers'] = dict(request.headers)
 
-            bypass_warp = request.query.get("warp", "").lower() == "off"
             logger.debug(f"Extractor Debug: Initial bypass_warp from query: {bypass_warp}")
 
             extractor = await self.get_extractor(
                 url, dict(request.headers), host=host_param, bypass_warp=bypass_warp
             )
-            result = await extractor.extract(url, **extractor_kwargs)
+
+            # Check if this extractor should bypass WARP or proxies based on admin config
+            extractor_key = self._extractor_key_for_instance(extractor)
+            if extractor_key:
+                base_key = extractor_key.replace("_direct", "")
+                
+                # Check warp off
+                warp_off_list = config_store.get("warp_off_extractors", [])
+                if base_key in warp_off_list:
+                    bypass_warp = True
+                    BYPASS_WARP_CONTEXT.set(True)
+                    logger.debug(f"WARP off for extractor: {base_key}")
+                    
+                # Check proxy off
+                proxy_off_list = config_store.get("proxy_off_extractors", [])
+                if base_key in proxy_off_list:
+                    BYPASS_PROXIES_CONTEXT.set(True)
+                    logger.debug(f"Proxy off for extractor: {base_key}")
+                    
+                if base_key in warp_off_list or base_key in proxy_off_list:
+                    # Re-resolve the extractor with updated context
+                    extractor = await self.get_extractor(
+                        url, dict(request.headers), host=host_param, bypass_warp=bypass_warp
+                    )
+
+            timeout = 60 if FLARESOLVERR_URL else 30
+            result = await asyncio.wait_for(
+                extractor.extract(url, **extractor_kwargs), timeout=timeout
+            )
+            extractor_key = self._extractor_key_for_instance(extractor)
+            stream_key = self._stream_key_for_url(request.query.get("orig_url") or url)
 
             stream_url = result["destination_url"]
             stream_headers = result.get("request_headers", {})
@@ -196,26 +245,24 @@ class HLSProxyExtractorHandlerMixin:
 
             if bypass_warp:
                 header_params += "&warp=off"
-            if selected_proxy:
+            if BYPASS_PROXIES_CONTEXT.get():
+                header_params += "&proxy=off"
+            elif selected_proxy:
                 header_params += f"&proxy={urllib.parse.quote(selected_proxy)}"
             if force_direct:
                 header_params += "&direct=1"
             orig_url_val = request.query.get("orig_url") or url
             if orig_url_val:
                 header_params += f"&orig_url={urllib.parse.quote(orig_url_val, safe='')}"
+            if extractor_key:
+                header_params += f"&extractor_key={urllib.parse.quote(extractor_key, safe='')}"
+            if stream_key:
+                header_params += f"&stream_key={urllib.parse.quote(stream_key, safe='')}"
 
             if redirect_stream and captured_manifest and endpoint == "/proxy/hls/manifest.m3u8":
                 original_channel_url = request.query.get("orig_url") or request.query.get("url") or request.query.get("d", "")
                 no_bypass = request.query.get("no_bypass") == "1"
-                is_vavoo_req = (
-                    "vavoo" in (request.query.get("h_Referer") or "").lower()
-                    or "vavoo" in (request.query.get("h_Origin") or "").lower()
-                    or "vavoo" in (stream_headers.get("Referer") or "").lower()
-                    or "vavoo" in (stream_headers.get("Origin") or "").lower()
-                    or "vavoo" in (request.headers.get("Referer") or "").lower()
-                    or "vavoo" in stream_url.lower()
-                    or any(x in stream_url.lower() for x in ["/sunshine/", "lokke", "mediahubmx"])
-                )
+                is_vavoo_req = check_vavoo_request(stream_headers, request, stream_url)
                 disable_ssl = request.query.get("disable_ssl") == "1" or force_disable_ssl or is_vavoo_req
 
                 async def shorten_captured_manifest_url(manifest_url: str) -> str:
@@ -234,17 +281,6 @@ class HLSProxyExtractorHandlerMixin:
                 extractor_name = getattr(extractor, 'extractor_name', None)
                 uses_captured_manifest = extractor_name in {"vidxgo"}
                 if uses_captured_manifest:
-                    async def shorten_captured_manifest_url(manifest_url: str) -> str:
-                        captured_text = captured_manifests.get(manifest_url)
-                        if captured_text:
-                            return await self.store_captured_hls_manifest(
-                                manifest_url,
-                                captured_text,
-                                stream_headers,
-                                source_url=original_channel_url,
-                            )
-                        return await self.shorten_hls_url(manifest_url)
-
                     rewritten_manifest = await ManifestRewriter.rewrite_manifest_urls(
                         manifest_content=captured_manifest,
                         base_url=stream_url,
@@ -261,6 +297,8 @@ class HLSProxyExtractorHandlerMixin:
                         disable_ssl=disable_ssl,
                         selected_proxy=selected_proxy,
                         force_direct=force_direct,
+                        extractor_key=extractor_key,
+                        stream_key=stream_key,
                     )
                     return web.Response(
                         text=rewritten_manifest,
@@ -300,7 +338,7 @@ class HLSProxyExtractorHandlerMixin:
                 # because Vavoo URLs/tokens change frequently and are highly dynamic.
                 is_vavoo = (host_param or "").lower() == "vavoo" or "vavoo.to" in url.lower() or "vavoo.tv" in url.lower()
                 if is_vavoo:
-                    logger.info("🎬 Vavoo stream detected: proxying directly without redirect")
+                    logger.info("[PLAY] Vavoo stream detected: proxying directly without redirect")
                     return await self._proxy_stream(
                         request,
                         stream_url,
@@ -320,6 +358,10 @@ class HLSProxyExtractorHandlerMixin:
                 q_params["api_password"] = api_password
             if selected_proxy:
                 q_params["proxy"] = selected_proxy
+            if extractor_key:
+                q_params["extractor_key"] = extractor_key
+            if stream_key:
+                q_params["stream_key"] = stream_key
 
             response_data = {
                 "destination_url": stream_url,
@@ -347,18 +389,24 @@ class HLSProxyExtractorHandlerMixin:
                     "timeout",
                     "temporarily unavailable",
                 ]
-            )
+            ) or isinstance(e, (asyncio.TimeoutError, asyncio.CancelledError))
 
+            if isinstance(e, asyncio.CancelledError):
+                logger.info("Extractor request cancelled (client disconnected)")
+                raise
             if is_expected_error:
                 logger.warning(f"⚠️ Extractor request failed (expected error): {e}")
             else:
                 logger.error(f"❌ Error in extractor request: {e}")
                 import traceback
-
                 traceback.print_exc()
 
-            return web.Response(text=str(e), status=500)
+            return web.json_response(
+                {"error": str(e), "status": "error"},
+                status=500
+            )
         finally:
             BYPASS_WARP_CONTEXT.reset(token)
+            BYPASS_PROXIES_CONTEXT.reset(proxy_bypass_token)
             SELECTED_PROXY_CONTEXT.reset(proxy_token)
             STRICT_PROXY_CONTEXT.reset(strict_proxy_token)

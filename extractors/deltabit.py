@@ -12,10 +12,11 @@ from config import (
     FLARESOLVERR_URL, 
     FLARESOLVERR_TIMEOUT, 
     get_solver_proxy_url, 
-    GLOBAL_PROXIES,
+    build_proxy_with_auth,
     get_connector_for_proxy,
     get_preferred_proxy_for_url,
 )
+import config as _cfg
 from utils.cookie_cache import CookieCache
 from utils.solver_manager import solver_manager, ensure_flaresolverr
 
@@ -50,7 +51,7 @@ class DeltabitExtractor:
         self.base_headers = self.request_headers.copy()
         if "User-Agent" not in self.base_headers and "user-agent" not in self.base_headers:
              self.base_headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        self.proxies = proxies or GLOBAL_PROXIES
+        self.proxies = proxies or _cfg.GLOBAL_PROXIES
         self.cache = CookieCache("universal")
         self.mediaflow_endpoint = "proxy_stream_endpoint"
         self.bypass_warp_active = bypass_warp
@@ -78,9 +79,11 @@ class DeltabitExtractor:
         fs_headers = {}
         if url: 
             payload["url"] = url
-            proxy = get_preferred_proxy_for_url(url, "deltabit", self.proxies, self.bypass_warp_active)
+            proxy = await get_preferred_proxy_for_url(url, "deltabit", self.proxies, self.bypass_warp_active)
             if proxy:
-                payload["proxy"] = {"url": proxy}
+                p = build_proxy_with_auth(proxy)
+                if p:
+                    payload["proxy"] = p
                 fs_headers["X-Proxy-Server"] = get_solver_proxy_url(proxy)
         if post_data: payload["postData"] = post_data
         if session_id: payload["session"] = session_id
@@ -99,16 +102,17 @@ class DeltabitExtractor:
     async def extract(self, url: str, **kwargs) -> dict:
         # Normalize URL for cache
         normalized_url = url.strip()
+        cache_key = (normalized_url, self.bypass_warp_active)
         DeltabitExtractor._prune_result_cache()
         # Check cache (10 minutes validity)
-        if normalized_url in DeltabitExtractor._result_cache:
-            res, ts = DeltabitExtractor._result_cache[normalized_url]
+        if cache_key in DeltabitExtractor._result_cache:
+            res, ts = DeltabitExtractor._result_cache[cache_key]
             if time.time() - ts < DeltabitExtractor._cache_ttl:
                 logger.info(f"🚀 [Cache Hit] Using cached extraction result for: {normalized_url}")
                 return res
         
         logger.info(f"🔍 [Cache Miss] Extracting new link for: {normalized_url}")
-        proxy = get_preferred_proxy_for_url(normalized_url, "deltabit", self.proxies, self.bypass_warp_active)
+        proxy = await get_preferred_proxy_for_url(normalized_url, "deltabit", self.proxies, self.bypass_warp_active)
         final_session_id = await solver_manager.get_persistent_session("deltabit", proxy)
         session_id = final_session_id
         is_persistent = True # Always persistent for this key
@@ -131,10 +135,12 @@ class DeltabitExtractor:
                                     t = await r.text()
                                     if not any(m in t.lower() for m in ["cf-challenge", "robot", "checking your browser"]):
                                         return t, str(r.url), ua, {k: v.value for k, v in r.cookies.items()}
-                except: pass
+                except Exception as e:
+                    logger.debug("Deltabit fetch attempt failed: %s", e)
+                    pass
                 return None
 
-            pref_p = get_preferred_proxy_for_url(url, "deltabit", self.proxies, self.bypass_warp_active)
+            pref_p = await get_preferred_proxy_for_url(url, "deltabit", self.proxies, self.bypass_warp_active)
             html = None
             attempts = []
             if pref_p:
@@ -158,7 +164,7 @@ class DeltabitExtractor:
                 link_match = re.search(r'sources:\s*\["([^"]+)"', html) or re.search(r'file:\s*["\']([^"\']+)["\']', html)
                 if link_match: 
                     result = self._build_result(link_match.group(1), url, ua, proxy, cookies=cookies)
-                    DeltabitExtractor._result_cache[normalized_url] = (result, time.time())
+                    DeltabitExtractor._result_cache[cache_key] = (result, time.time())
                     DeltabitExtractor._prune_result_cache()
                     logger.info("✅ Extraction success (direct source found)")
                     return result
@@ -177,7 +183,7 @@ class DeltabitExtractor:
             link_match = re.search(r'sources:\s*\["([^"]+)"', post_html) or re.search(r'file:\s*["\']([^"\']+)["\']', post_html)
             if not link_match: raise ExtractorError("Deltabit: Video source not found")
             result = self._build_result(link_match.group(1), url, ua, proxy, cookies=cookies)
-            DeltabitExtractor._result_cache[normalized_url] = (result, time.time())
+            DeltabitExtractor._result_cache[cache_key] = (result, time.time())
             DeltabitExtractor._prune_result_cache()
             return result
         finally:

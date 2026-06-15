@@ -258,37 +258,17 @@ class ManifestRewriter:
         disable_ssl: bool = False,
         selected_proxy: str = None,
         force_direct: bool = False,
+        extractor_key: str = None,
+        stream_key: str = None,
     ) -> str:
         """Riscrive gli URL nei manifest HLS per passare attraverso il proxy."""
         lines = manifest_content.split("\n")
         rewritten_lines = []
 
-        # Determina se e VixSrc (logica speciale per quality selection)
-        is_vixsrc_stream = False
-
-        try:
-            if get_extractor_func:
-                original_request_url = (
-                    stream_headers.get("referer")
-                    or stream_headers.get("Referer")
-                    or base_url
-                )
-                extractor = await get_extractor_func(original_request_url, {})
-
-                if hasattr(extractor, "is_vixsrc") and extractor.is_vixsrc:
-                    is_vixsrc_stream = True
-                    logger.debug("Detected VixSrc stream.")
-        except Exception as e:
-            logger.error(f"Error in extractor detection: {e}")
-
         # no_bypass e mantenuto per compatibilita, ma il rewriter ora proxa sempre.
         _ = no_bypass
 
-        # ExoPlayer is stricter than VLC about HLS master/media relationships.
-        # For VixSrc, preserve the full master instead of collapsing to one
-        # variant, otherwise audio/video TrackGroups can become inconsistent.
-
-        # Generic master-playlist optimization: keep only the highest-bandwidth
+        # Master-playlist optimization: keep only the highest-bandwidth
         # video variant, while preserving audio/media tags and other metadata.
         generic_streams = []
         for i, line in enumerate(lines):
@@ -304,7 +284,7 @@ class ManifestRewriter:
                     }
                 )
 
-        if generic_streams and not is_vixsrc_stream:
+        if generic_streams:
             highest_quality_stream = max(generic_streams, key=lambda x: x["bandwidth"])
             logger.debug(
                 "Generic HLS: selected max bandwidth %s.",
@@ -345,6 +325,10 @@ class ManifestRewriter:
                 header_params += "&direct=1"
             if original_channel_url:
                 header_params += f"&orig_url={urllib.parse.quote(original_channel_url, safe='')}"
+            if extractor_key:
+                header_params += f"&extractor_key={urllib.parse.quote(extractor_key, safe='')}"
+            if stream_key:
+                header_params += f"&stream_key={urllib.parse.quote(stream_key, safe='')}"
 
             absolute_variant_url = ManifestRewriter._inherit_query_if_missing(
                 urljoin(base_url, highest_quality_stream["url"]),
@@ -478,6 +462,10 @@ class ManifestRewriter:
             header_params += "&direct=1"
         if original_channel_url:
             header_params += f"&orig_url={urllib.parse.quote(original_channel_url, safe='')}"
+        if extractor_key:
+            header_params += f"&extractor_key={urllib.parse.quote(extractor_key, safe='')}"
+        if stream_key:
+            header_params += f"&stream_key={urllib.parse.quote(stream_key, safe='')}"
 
         # Estrai query params dal base_url per ereditarli se necessario
         base_parsed = urllib.parse.urlparse(base_url)

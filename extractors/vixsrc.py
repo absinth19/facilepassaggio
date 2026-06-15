@@ -13,8 +13,8 @@ import aiohttp
 from aiohttp import ClientSession, ClientTimeout, TCPConnector
 from aiohttp_socks import ProxyError as AioProxyError
 from python_socks import ProxyError as PyProxyError
-from config import TRANSPORT_ROUTES, GLOBAL_PROXIES, WARP_PROXY_URL, get_connector_for_proxy, SELECTED_PROXY_CONTEXT, STRICT_PROXY_CONTEXT, get_solver_proxy_url, get_extractor_proxies, get_ordered_proxies_for_url, should_allow_direct_fallback, mark_proxy_dead, is_proxy_alive
-from config import PROXY_TEST_TIMEOUT, PROXY_TEST_CONCURRENCY
+from config import WARP_PROXY_URL, get_connector_for_proxy, SELECTED_PROXY_CONTEXT, STRICT_PROXY_CONTEXT, get_solver_proxy_url, get_extractor_proxies, get_ordered_proxies_for_url, should_allow_direct_fallback, mark_proxy_dead, DEAD_PROXIES, _proxy_lock
+import config as _cfg
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +25,8 @@ class ExtractorError(Exception):
 
 class VixSrcExtractor:
     """VixSrc URL extractor per risolvere link VixSrc."""
-    def __init__(self, request_headers: dict, proxies: list = None):
+    def __init__(self, request_headers: dict, proxies: list = None, bypass_warp: bool = None):
+        self.bypass_warp_active = bypass_warp if bypass_warp is not None else False  # Use WARP by default
         self.request_headers = request_headers
         self.base_headers = self._default_headers()
         self.session = None
@@ -33,7 +34,7 @@ class VixSrcExtractor:
         self.mediaflow_endpoint = "hls_manifest_proxy"
         self._session_lock = asyncio.Lock()
         self.proxies = []
-        for proxy in list(proxies or []) + list(GLOBAL_PROXIES):
+        for proxy in list(proxies or []) + list(_cfg.GLOBAL_PROXIES):
             if proxy and proxy not in self.proxies:
                 self.proxies.append(proxy)
         self.is_vixsrc = True
@@ -41,11 +42,10 @@ class VixSrcExtractor:
         self.last_used_proxy = None
         self.last_used_direct = False
         logger.info(
-            "VixSrc proxy config: transport_routes=%d dedicated_proxies=%d fallback_proxies=%d resolved_vixsrc=%s",
-            len(TRANSPORT_ROUTES),
+            "VixSrc proxy config: transport_routes=%d dedicated_proxies=%d fallback_proxies=%d",
+            len(_cfg.TRANSPORT_ROUTES),
             len(self._dedicated_proxies()),
             len(self.proxies or []),
-            self._preferred_proxy("https://vixsrc.to/"),
         )
     @staticmethod
     def _normalize_proxy_url(proxy_value: str) -> str:
@@ -61,7 +61,7 @@ class VixSrcExtractor:
 
     def _dedicated_proxies(self) -> list[str]:
         proxies = []
-        global_proxies = {self._normalize_proxy_url(proxy) for proxy in GLOBAL_PROXIES if proxy}
+        global_proxies = {self._normalize_proxy_url(proxy) for proxy in _cfg.GLOBAL_PROXIES if proxy}
         warp_proxy = self._normalize_proxy_url(WARP_PROXY_URL) if WARP_PROXY_URL else None
         for proxy in get_extractor_proxies(self.extractor_name):
             if not proxy:
@@ -82,20 +82,31 @@ class VixSrcExtractor:
     def _has_strict_proxy_source(self, forced_proxy: str | None = None) -> bool:
         return bool(forced_proxy or self._dedicated_proxies())
 
-    def _proxy_candidates(self, url: str, forced_proxy: str | None = None) -> list[str]:
+    async def _proxy_candidates(self, url: str, forced_proxy: str | None = None) -> list[str]:
         if forced_proxy:
             proxy = self._normalize_proxy_url(forced_proxy)
             return [proxy]
 
+        # Filter out WARP from fallback proxies when bypass is active
+        fallback = self.proxies
+        if self.bypass_warp_active and WARP_PROXY_URL:
+            fallback = [p for p in (self.proxies or []) if p != WARP_PROXY_URL and p != self._normalize_proxy_url(WARP_PROXY_URL)]
+
         dedicated = self._dedicated_proxies()
-        if dedicated:
-            alive = [proxy for proxy in dedicated if is_proxy_alive(proxy)]
-            return alive or dedicated
+        if not dedicated:
+            return get_ordered_proxies_for_url(url, self.extractor_name, fallback, bypass_warp=self.bypass_warp_active)
 
-        return get_ordered_proxies_for_url(url, self.extractor_name, self.proxies)
+        # Skip socket check - rely on DEAD_PROXIES + curl_cffi rotation for liveness
+        now = time.time()
+        with _proxy_lock:
+            alive = [p for p in dedicated if p not in DEAD_PROXIES or now >= DEAD_PROXIES.get(p, 0)]
+        if alive:
+            return alive
+        # All dedicated proxies dead — fall back to general resolution (direct, WARP, etc.)
+        return get_ordered_proxies_for_url(url, self.extractor_name, fallback, bypass_warp=self.bypass_warp_active)
 
-    def _preferred_proxy(self, url: str, forced_proxy: str | None = None) -> str | None:
-        candidates = self._proxy_candidates(url, forced_proxy)
+    async def _preferred_proxy(self, url: str, forced_proxy: str | None = None) -> str | None:
+        candidates = await self._proxy_candidates(url, forced_proxy)
         return candidates[0] if candidates else None
 
     @staticmethod
@@ -138,14 +149,14 @@ class VixSrcExtractor:
                 if self.status >= 400:
                     raise ExtractorError(f"curl_cffi HTTP error {self.status} for {self.url}")
 
-        proxies_to_try = self._proxy_candidates(url, forced_proxy)
+        proxies_to_try = await self._proxy_candidates(url, forced_proxy)
         if not proxies_to_try and self._has_strict_proxy_source(forced_proxy):
             raise ExtractorError("No alive VixSrc dedicated/forced proxy available")
         preferred_proxy = proxies_to_try[0] if proxies_to_try else None
         logger.info(
             "VixSrc curl proxy lookup: url=%s transport_routes=%d dedicated_proxies=%d fallback_proxies=%d resolved=%d preferred_proxy=%s",
             url,
-            len(TRANSPORT_ROUTES),
+            len(_cfg.TRANSPORT_ROUTES),
             len(self._dedicated_proxies()),
             len(self.proxies or []),
             len(proxies_to_try),
@@ -166,8 +177,8 @@ class VixSrcExtractor:
         final_headers.pop("User-Agent", None)
         final_headers.pop("user-agent", None)
 
-        timeout = PROXY_TEST_TIMEOUT
-        concurrency = PROXY_TEST_CONCURRENCY
+        timeout = _cfg.PROXY_TEST_TIMEOUT
+        concurrency = _cfg.PROXY_TEST_CONCURRENCY
 
         async def _try_one(proxy_value: str | None, imp: str):
             request_kwargs = {}
@@ -186,7 +197,7 @@ class VixSrcExtractor:
                     content = resp.text
                 if 200 <= resp.status_code < 300:
                     return True, proxy, MockResponse(content, resp.status_code, url), None, resp.status_code
-                if proxy_value and resp.status_code != 404:
+                if proxy_value and resp.status_code not in (403, 404):
                     mark_proxy_dead(proxy_value)
                 return False, proxy, None, None, resp.status_code
             except Exception as exc:
@@ -198,6 +209,9 @@ class VixSrcExtractor:
         proxy_batches = [specific, [p for p in proxies_to_try if p not in specific]] if specific else [proxies_to_try]
 
         for imp in impersonations:
+            if asyncio.current_task().cancelled():
+                logger.info("Extraction cancelled, skipping remaining impersonations for %s", url)
+                raise asyncio.CancelledError()
             logger.info(
                 "VixSrc curl_cffi testing %d proxies for %s (imp=%s, concurrency=%d, timeout=%ss)",
                 len(proxies_to_try), url, imp, concurrency, timeout,
@@ -232,11 +246,16 @@ class VixSrcExtractor:
                     for pending in tasks:
                         if not pending.done():
                             pending.cancel()
-                    await asyncio.gather(*tasks, return_exceptions=True)
+                    try:
+                        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=3)
+                    except asyncio.TimeoutError:
+                        pass
 
         if last_error:
             raise ExtractorError(f"curl_cffi request failed for {url}: {last_error}")
-        raise ExtractorError(f"curl_cffi HTTP error {last_status} for {url}")
+        if last_status is not None:
+            raise ExtractorError(f"curl_cffi HTTP error {last_status} for {url}")
+        raise ExtractorError(f"curl_cffi failed for {url}: no usable proxy found")
 
     @staticmethod
     def _normalize_base_site(url: str) -> str:
@@ -253,7 +272,7 @@ class VixSrcExtractor:
         timeout = ClientTimeout(total=60, connect=30, sock_read=30)
         if proxy:
             logger.debug("Using proxy %s for VixSrc session.", proxy)
-            connector = get_connector_for_proxy(proxy)
+            connector = get_connector_for_proxy(proxy, ssl=False)
         else:
             connector = TCPConnector(
                 limit=0,
@@ -262,6 +281,7 @@ class VixSrcExtractor:
                 enable_cleanup_closed=True,
                 force_close=False,
                 use_dns_cache=True,
+                ssl=False,
             )
         return ClientSession(
             timeout=timeout,
@@ -295,7 +315,7 @@ class VixSrcExtractor:
         if forced_proxy:
             proxy = self._normalize_proxy_url(forced_proxy)
         elif url:
-            proxy = self._preferred_proxy(url)
+            proxy = await self._preferred_proxy(url)
         else:
             proxy = self._get_random_proxy()
         if proxy:
@@ -313,27 +333,56 @@ class VixSrcExtractor:
         return self.session
 
     async def _make_robust_request(
-        self, url: str, headers: dict = None, retries: int = 1, initial_delay: int = 2, forced_proxy: str | None = None
+        self, url: str, headers: dict = None, retries: int = 2, initial_delay: int = 2, forced_proxy: str | None = None
     ):
-        """Effettua richieste HTTP robuste con retry automatico."""
+        """Effettua richieste HTTP robuste con retry automatico e proxy rotation."""
         final_headers = headers or {}
+        last_error = None
 
         for attempt in range(retries):
             try:
+                if last_error is not None:
+                    # Close session and force a different proxy on retry
+                    try:
+                        await self.session.close()
+                    except Exception:
+                        pass
+                    self.session = None
+                    if self.session_proxy:
+                        mark_proxy_dead(self.session_proxy)
+                        self.session_proxy = None
+                    forced_proxy = None  # Don't reuse dead proxy
+
                 session = await self._get_session(url, forced_proxy=forced_proxy)
                 logger.info("Attempt %s/%s for URL: %s", attempt + 1, retries, url)
 
-                async with session.get(url, headers=final_headers) as response:
-                    response.raise_for_status()
+                async with session.get(url, headers=final_headers, timeout=aiohttp.ClientTimeout(total=15, connect=10)) as response:
                     content = await response.text()
+                    status = response.status
+
+                    if self._is_cloudflare_challenge(content, status):
+                        logger.info("Cloudflare challenge screen or status %s detected for %s. Triggering curl_cffi direct bypass...", status, url)
+                        try:
+                            headers_cf = final_headers or self._default_headers()
+                            return await self._make_curl_request(url, headers=headers_cf, forced_proxy=forced_proxy)
+                        except Exception as cffi_exc:
+                            logger.warning("curl_cffi fallback failed for %s: %s", url, cffi_exc)
+                            raise aiohttp.ClientResponseError(
+                                request_info=response.request_info,
+                                history=response.history,
+                                status=status,
+                                message=f"Cloudflare challenge bypass failed: {cffi_exc}"
+                            )
+
+                    response.raise_for_status()
 
                     class MockResponse:
-                        def __init__(self, text_content, status, headers_dict, response_url):
+                        def __init__(self, text_content, status_val, headers_dict, response_url):
                             self._text = text_content
-                            self.status = status
+                            self.status = status_val
                             self.headers = headers_dict
                             self.url = response_url
-                            self.status_code = status
+                            self.status_code = status_val
                             self.text = text_content
 
                         async def text_async(self):
@@ -395,9 +444,9 @@ class VixSrcExtractor:
                 if e.status == 404:
                     raise ExtractorError(f"VixSrc content not found (404): {url}")
 
-                if e.status == 403 and attempt == retries - 1:
+                if e.status == 403:
                     try:
-                        logger.info("aiohttp 403, trying curl_cffi with configured proxies for %s", url)
+                        logger.info("aiohttp 403 detected, trying curl_cffi for %s", url)
                         headers_403 = final_headers or self._default_headers()
                         return await self._make_curl_request(url, headers=headers_403, forced_proxy=forced_proxy)
                     except Exception as cffi_exc:
@@ -412,6 +461,17 @@ class VixSrcExtractor:
                 if attempt == retries - 1:
                     raise ExtractorError(f"Final error for {url}: {str(e)}")
                 await asyncio.sleep(initial_delay)
+
+
+
+    def _is_cloudflare_challenge(self, html: str, status: int) -> bool:
+        """Determines if the response is a Cloudflare verification challenge screen."""
+        if status in (403, 503):
+            return True
+        low_html = html.lower()
+        if "cloudflare" in low_html and ("ray id" in low_html or "captcha" in low_html or "turnstile" in low_html or "challenge-platform" in low_html):
+            return True
+        return False
 
     async def _parse_html_simple(self, html_content: str, tag: str, attrs: dict = None):
         """Parser HTML semplificato senza BeautifulSoup."""
@@ -477,16 +537,33 @@ class VixSrcExtractor:
                 raise ExtractorError(f"VixSrc API endpoint not found (404): {api_url}")
             logger.warning("curl_cffi failed for API, trying robust: %s", curl_err)
             try:
-                response = await self._make_robust_request(api_url, headers=api_headers, forced_proxy=forced_proxy)
+                response = await self._make_robust_request(api_url, headers=api_headers, forced_proxy=None)
             except Exception as robust_err:
                 if "404" in str(robust_err):
                     raise ExtractorError(f"VixSrc content not found (404): {api_url}")
                 raise ExtractorError(f"VixSrc API fetch failed: {robust_err}") from robust_err
 
         try:
+            logger.debug("VixSrc API raw response (first 500): %s", response.text[:500])
             payload = json.loads(response.text)
-        except json.JSONDecodeError as exc:
-            raise ExtractorError(f"Invalid API response from {api_url}: {exc}")
+        except json.JSONDecodeError:
+            text = None
+            # Try <pre> tag (Chrome JSON viewer wraps JSON in <pre>)
+            pre_match = re.search(r"<pre[^>]*>(.*?)</pre>", response.text, re.DOTALL)
+            if pre_match:
+                text = html.unescape(pre_match.group(1))
+            else:
+                # Try direct JSON with HTML entities decoded
+                stripped = response.text.strip()
+                if stripped.startswith("{"):
+                    text = html.unescape(stripped)
+            if text:
+                try:
+                    payload = json.loads(text)
+                except json.JSONDecodeError as exc2:
+                    raise ExtractorError(f"Invalid API response from {api_url}: {exc2}")
+            else:
+                raise ExtractorError(f"Invalid API response from {api_url}: response is not JSON")
 
         embed_path = payload.get("src")
         if not embed_path:
@@ -596,6 +673,7 @@ class VixSrcExtractor:
 
     async def extract(self, url: str, **kwargs) -> Dict[str, Any]:
         """Estrae URL VixSrc."""
+        url = url.replace("vixsrc.to", "calpezz8.space").replace("vixcloud.co", "calpezz8.space")
         try:
             forced_proxy = kwargs.get("proxy")
             if forced_proxy:
@@ -607,7 +685,7 @@ class VixSrcExtractor:
                 logger.info("URL is already a VixSrc manifest, no extraction required.")
                 selected_proxy = forced_proxy or parse_qs(parsed_url.query).get("proxy", [None])[0]
                 if not selected_proxy:
-                    selected_proxy = self.last_used_proxy or self._preferred_proxy(url)
+                    selected_proxy = self.last_used_proxy or await self._preferred_proxy(url)
                 if selected_proxy:
                     selected_proxy = self._normalize_proxy_url(selected_proxy)
                 logger.debug(f"Extractor Debug: Extractor result selected_proxy: {selected_proxy}")
@@ -625,6 +703,7 @@ class VixSrcExtractor:
                     "mediaflow_endpoint": self.mediaflow_endpoint,
                     "selected_proxy": selected_proxy,
                     "force_direct": bool(kwargs.get("force_direct")) or (selected_proxy is None and self.last_used_direct),
+                    "bypass_warp": self.bypass_warp_active,
                 }
 
             if "/embed/" in parsed_url.path:
@@ -641,16 +720,17 @@ class VixSrcExtractor:
                         forced_proxy=forced_proxy,
                     )
                 except Exception as curl_err:
+                    logger.warning("curl_cffi failed for embed %s: %s", vix_url, curl_err)
                     raise ExtractorError(f"VixSrc embed fetch failed: {curl_err}") from curl_err
             elif "iframe" in url:
                 site_url = url.split("/iframe")[0]
-                version = await self.version(site_url, forced_proxy=forced_proxy)
+                version = await self.version(site_url, forced_proxy=None)
                 response = await self._make_robust_request(
                     url,
                     headers=self._fresh_headers(
                         **{"x-inertia": "true", "x-inertia-version": version}
                     ),
-                    forced_proxy=forced_proxy,
+                    forced_proxy=None,
                 )
 
                 iframe_data = await self._parse_html_simple(response.text, "iframe")
@@ -661,7 +741,7 @@ class VixSrcExtractor:
                         headers=self._fresh_headers(
                             **{"x-inertia": "true", "x-inertia-version": version}
                         ),
-                        forced_proxy=forced_proxy,
+                        forced_proxy=None,
                     )
                 else:
                     raise ExtractorError("No iframe found in response")
@@ -675,12 +755,12 @@ class VixSrcExtractor:
                             forced_proxy=forced_proxy,
                         )
                     except Exception as curl_err:
-                        logger.warning("curl_cffi failed for embed %s, trying robust/FS: %s", embed_url, curl_err)
+                        logger.warning("curl_cffi failed for embed %s, trying robust: %s", embed_url, curl_err)
                         try:
                             response = await self._make_robust_request(
                                 embed_url,
                                 headers=self._fresh_headers(referer=url),
-                                forced_proxy=forced_proxy,
+                                forced_proxy=None,
                             )
                         except Exception as robust_err:
                             raise ExtractorError(f"VixSrc embed fetch failed: {robust_err}") from robust_err
@@ -690,7 +770,7 @@ class VixSrcExtractor:
                     except Exception as curl_err:
                         logger.warning("curl_cffi failed for %s, trying robust: %s", url, curl_err)
                         try:
-                            response = await self._make_robust_request(url, forced_proxy=forced_proxy)
+                            response = await self._make_robust_request(url, forced_proxy=None)
                         except Exception as robust_err:
                             raise ExtractorError(f"VixSrc URL fetch failed: {robust_err}") from robust_err
             else:
@@ -746,9 +826,9 @@ class VixSrcExtractor:
             if not final_url:
                 raise ExtractorError("No playlist data found in response")
 
-            # Rewrite vixcloud.co → vixsrc.to in the final URL too
-            final_url = final_url.replace("vixcloud.co", "vixsrc.to")
-            stream_url = url.replace("vixcloud.co", "vixsrc.to")
+            # Rewrite vixcloud.co/vixsrc.to → calpezz8.space in the final URL too
+            final_url = final_url.replace("vixcloud.co", "calpezz8.space").replace("vixsrc.to", "calpezz8.space")
+            stream_url = url.replace("vixcloud.co", "calpezz8.space").replace("vixsrc.to", "calpezz8.space")
 
             stream_headers = self._fresh_headers(Referer=stream_url)
 
@@ -759,6 +839,7 @@ class VixSrcExtractor:
                 "mediaflow_endpoint": self.mediaflow_endpoint,
                 "selected_proxy": self.last_used_proxy,
                 "force_direct": self.last_used_proxy is None and self.last_used_direct,
+                "bypass_warp": self.bypass_warp_active,
             }
 
         except Exception as e:

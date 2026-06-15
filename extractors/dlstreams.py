@@ -17,10 +17,10 @@ except ImportError:
     BeautifulSoup = None
 
 from config import (
-    GLOBAL_PROXIES,
     get_connector_for_proxy,
     get_preferred_proxy_for_url,
 )
+import config as _cfg
 from extractors.shared_browser import close_shared_browser, get_shared_browser_context
 
 logger = logging.getLogger(__name__)
@@ -190,10 +190,10 @@ class DLStreamsExtractor:
 
     async def _launch_browser(self, url: str | None = None):
         target_url = url or self.entry_origin or self.stream_origin
-        proxy_url = get_preferred_proxy_for_url(
+        proxy_url = await get_preferred_proxy_for_url(
             target_url,
             "dlstreams",
-            self.proxies or GLOBAL_PROXIES,
+            self.proxies or _cfg.GLOBAL_PROXIES,
             self.bypass_warp_active,
         ) if target_url else None
         async with self._browser_launch_lock:
@@ -737,7 +737,7 @@ class DLStreamsExtractor:
     async def _get_session(self, url: str | None = None):
         # Determine the correct proxy for the current state
         target_url = url or self.stream_origin or self.entry_origin
-        proxy_url = get_preferred_proxy_for_url(target_url, "dlstreams", self.proxies, self.bypass_warp_active)
+        proxy_url = await get_preferred_proxy_for_url(target_url, "dlstreams", self.proxies, self.bypass_warp_active)
         
         # If we have an existing session, check if its proxy matches what we need now
         if self.session and not self.session.closed:

@@ -13,3 +13,6 @@ Pillow
 curl_cffi
 cloudscraper
 brotli
+seleniumbase
+pyvirtualdisplay
+psutil
